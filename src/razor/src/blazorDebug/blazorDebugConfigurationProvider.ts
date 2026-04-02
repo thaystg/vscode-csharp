@@ -226,8 +226,12 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
                 browser.inspectUri = originalInspectUri;
                 browser.port = undefined;
                 const oldPid = BlazorDebugConfigurationProvider.pidsByUrl.get(browser.url);
-                if (oldPid != undefined) {
-                    process.kill(oldPid);
+                if (oldPid !== undefined && oldPid > 0) {
+                    try {
+                        process.kill(oldPid);
+                    } catch {
+                        // Process may have already terminated
+                    }
                 }
             }
         }
@@ -333,6 +337,12 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         let newUri = '';
         const spawnedProxy = cp.spawn(dotnetPath, spawnedProxyArgs, cpOptions);
         const eventEmmiter = new EventEmitter();
+        spawnedProxy.on('error', (err) => {
+            BlazorDebugConfigurationProvider.vsWebAssemblyBridgeOutputChannel.appendLine(
+                `Failed to spawn proxy: ${err.message}`
+            );
+            eventEmmiter.emit('vsWebAssemblyReady');
+        });
         function handleData(stream: NodeJS.ReadableStream) {
             stream.on('data', (chunk) => {
                 BlazorDebugConfigurationProvider.vsWebAssemblyBridgeOutputChannel.appendLine(chunk.toString());
@@ -360,8 +370,12 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
                         `Debugging proxy is running at: ${proxyUrlString}`
                     );
                     const oldPid = BlazorDebugConfigurationProvider.pidsByUrl.get(urlStr);
-                    if (oldPid != undefined) {
-                        process.kill(oldPid);
+                    if (oldPid !== undefined && oldPid > 0) {
+                        try {
+                            process.kill(oldPid);
+                        } catch {
+                            // Process may have already terminated
+                        }
                     }
                     BlazorDebugConfigurationProvider.pidsByUrl.set(urlStr, spawnedProxy.pid);
                     const url = new URL(proxyUrlString);
@@ -512,9 +526,8 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
             return false;
         }
         const existWebAssemblyWebBridge = existsSync(BlazorDebugConfigurationProvider.getWebAssemblyWebBridgePath());
-        const csharpDevKitExtension = getCSharpDevKit();
-        let isNet9OrNewer = true;
-        if (existWebAssemblyWebBridge && csharpDevKitExtension !== undefined) {
+        let isNet9OrNewer = false;
+        if (existWebAssemblyWebBridge) {
             isNet9OrNewer = await BlazorDebugConfigurationProvider.isNet9OrNewer(projectPath);
         }
         return useVSDbg && existWebAssemblyWebBridge && isNet9OrNewer;

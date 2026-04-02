@@ -347,6 +347,9 @@ export class AssetGenerator {
     }
 
     public getAssetsPathAndProgram(): [string, string] {
+        if (this.executableProjects.length === 0) {
+            return ['', ''];
+        }
         let assetsPath = ``;
         this.executableProjects.forEach((project) => {
             if (project.isWebAssemblyProject) {
@@ -370,7 +373,6 @@ export class AssetGenerator {
     }
 
     public isDotNet9OrNewer(): boolean {
-        let ret = false;
         for (let i = 0; i < this.executableProjects.length; i++) {
             const project = this.executableProjects[i];
             if (project?.isWebAssemblyProject) {
@@ -378,26 +380,29 @@ export class AssetGenerator {
                 projectFileText = projectFileText.toLowerCase();
                 const pattern =
                     /.*<targetframework>.*<\/targetframework>.*|.*<targetframeworks>.*<\/targetframeworks>.*/;
-                const pattern2 = /^net(\d+\.\d+)\b/g;
+                const tfmPattern = /net(\d+\.\d+)/g;
                 const match = projectFileText.match(pattern);
                 if (match) {
-                    const matches = match[0]
+                    const tfmContent = match[0]
                         .replace('<targetframework>', '')
                         .replace('</targetframework>', '')
                         .replace('<targetframeworks>', '')
                         .replace('</targetframeworks>', '')
-                        .trim()
-                        .matchAll(pattern2);
-                    for (const match of matches) {
-                        ret = true;
-                        if (match && +match[1] < 9) {
+                        .trim();
+                    const matches = [...tfmContent.matchAll(tfmPattern)];
+                    if (matches.length === 0) {
+                        continue;
+                    }
+                    for (const m of matches) {
+                        if (+m[1] < 9) {
                             return false;
                         }
                     }
+                    return true;
                 }
             }
         }
-        return ret;
+        return false;
     }
 }
 
