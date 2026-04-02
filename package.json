@@ -701,7 +701,7 @@
     {
       "id": "VSWebAssemblyBridge",
       "description": "VSWebAssemblyBridge (Platform Agnostic)",
-      "url": "https://vsdebugger.blob.core.windows.net/vswebassemblybridge-9-0-640601/vswebassemblybridge.zip",
+      "url": "https://vsdebugger.blob.core.windows.net/vswebassemblybridge-9-0-705702/vswebassemblybridge.zip",
       "installPath": ".vswebassemblybridge",
       "platforms": [
         "win32",
@@ -713,7 +713,7 @@
         "x86_64",
         "arm64"
       ],
-      "integrity": "2D3BA529626307448281E719BC3182E09475A4571741E08AFA401579E8895AFA"
+      "integrity": "9FDBDC91E2D79028A8932C1A96D3ABCFC7F40472FBC8F226E3FB1F6A1B5C97E7"
     }
   ],
   "engines": {

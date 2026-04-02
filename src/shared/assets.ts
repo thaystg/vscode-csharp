@@ -358,6 +358,17 @@ export class AssetGenerator {
         return [assetsPath, this.executableProjects[0].outputPath];
     }
 
+    /**
+     * Returns [assetsPath, program] for wasm projects that target .NET 9 or newer,
+     * or undefined if no such project exists.
+     */
+    public getNet9WasmAssetsPathAndProgram(): [string, string] | undefined {
+        if (!this.isDotNet9OrNewer()) {
+            return undefined;
+        }
+        return this.getAssetsPathAndProgram();
+    }
+
     public isDotNet9OrNewer(): boolean {
         let ret = false;
         for (let i = 0; i < this.executableProjects.length; i++) {

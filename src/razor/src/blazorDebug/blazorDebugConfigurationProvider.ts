@@ -17,56 +17,43 @@ import * as cp from 'child_process';
 import { getExtensionPath } from '../../../common';
 import { debugSessionTracker } from '../../../coreclrDebug/provisionalDebugSessionTracker';
 import { getCSharpDevKit } from '../../../utils/getCSharpDevKit';
-import Descriptors from '../../../lsptoolshost/solutionSnapshot/descriptors';
-import { CancellationToken } from 'vscode';
-import { IDisposable, IObserver } from '@microsoft/servicehub-framework';
+import { IDisposable } from '@microsoft/servicehub-framework';
+import { Observer } from '@microsoft/servicehub-framework/js/src/jsonRpc/Observer';
 import { EventEmitter } from 'events';
+import {
+    Formatters,
+    MessageDelimiters,
+    ServiceJsonRpcDescriptor,
+    ServiceMoniker,
+    ServiceRpcDescriptor,
+} from '@microsoft/servicehub-framework';
 
-export interface Project {
-    Id: {
-        ProjectPath: string;
-        ProjectGuid?: string;
-    };
-    ActiveConfigurations?: [ProjectConfiguration];
+interface IDebugTargetFrameworkService {
+    subscribe(observer: Observer<ProjectDebugTargetFrameworkInfo[]>): Promise<IDisposable>;
 }
 
-export interface QueryResult<T> {
-    Versions?: any;
-
-    Items?: [T];
+interface ProjectDebugTargetFrameworkInfo {
+    fullPath: string;
+    debugTargetFramework: string | undefined;
+    availableTargetFrameworks: FrameworkInfo[];
 }
 
-export interface ProjectConfiguration {
-    BuildProperties?: any;
+interface FrameworkInfo {
+    framework: string;
+    displayName: string;
 }
 
-/**
- * This service provides implementation to execute a project query.
- */
-export interface IQueryExecutionService {
-    /**
-     * execute a query.
-     * @param query a query string.
-     */
-    ExecuteQueryAsync(query: string, cancellationToken?: CancellationToken): Promise<string>;
+const targetFrameworkServiceDescriptor: ServiceRpcDescriptor = Object.freeze(
+    new ServiceJsonRpcDescriptor(
+        ServiceMoniker.create('Microsoft.VisualStudio.ProjectSystem.DebugTargetFrameworkService', '0.1'),
+        Formatters.Utf8,
+        MessageDelimiters.HttpLikeHeaders,
+        {
+            protocolMajorVersion: 3,
+        }
+    )
+);
 
-    /**
-     * execute an update query.
-     * @param query a query string.
-     */
-    ExecuteRemoteExecutableAsync(query: string, cancellationToken?: CancellationToken): Promise<string>;
-
-    /**
-     * Subscribe query results/
-     * @param query a query string.
-     * @param resultsReceiver an observer to receive results.
-     */
-    SubscribeQueryResultsAsync(
-        query: string,
-        resultsReceiver: IObserver<string>,
-        cancellationToken?: CancellationToken
-    ): Promise<IDisposable>;
-}
 import { ActionOption, showErrorMessage, showInformationMessage } from '../../../shared/observers/utils/showMessage';
 
 export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurationProvider {
@@ -302,6 +289,7 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
 
         try {
             await this.vscodeType.debug.startDebugging(folder, app);
+
             const terminate = this.vscodeType.debug.onDidTerminateDebugSession(async (event) => {
                 if (process.platform !== 'win32') {
                     const blazorDevServer = 'blazor-devserver\\.dll';
@@ -394,70 +382,128 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         return [newUri, proxyICorDebugPort, proxyBrowserPort];
     }
 
+    /**
+     * Determines if the project targets .NET 9 or newer using the C# Dev Kit
+     * IDebugTargetFrameworkService. Falls back to csproj parsing if the service
+     * is unavailable.
+     */
     private static async isNet9OrNewer(projectPath: string): Promise<boolean> {
-        let isNet9OrNewer = false;
-        const configurationsObject = {
-            $properties: ['BuildProperties'],
-            BuildProperties: {
-                $properties: ['Id', 'Name', 'Value', 'StorageType'],
-                $where: {
-                    '&&': [
-                        { '==': [{ '.': 'Name' }, 'TargetFramework'] },
-                        { '==': [{ '.': 'StorageType' }, 'ProjectFile'] },
-                    ],
-                },
-            },
-        };
-        const query = {
-            context: 'Projects',
-            query: {
-                $properties: ['ActiveConfigurations', 'Path'],
-                ActiveConfigurations: configurationsObject,
-                $filter: { ProjectsByCapabilities: ['WebAssembly'] },
-            },
-        };
-        let queryString = '';
-        if (projectPath != '') {
-            const query = {
-                context: 'Projects',
-                query: {
-                    $properties: ['ActiveConfigurations', 'Path'],
-                    ActiveConfigurations: configurationsObject,
-                    $where: { startswith: [{ '.': 'Path' }, projectPath] },
-                },
-            };
-            queryString = JSON.stringify(query);
-        } else {
-            queryString = JSON.stringify(query);
+        const devKitResult = await BlazorDebugConfigurationProvider.isNet9OrNewerViaDevKit(projectPath);
+        if (devKitResult !== undefined) {
+            return devKitResult;
         }
-        const proxy = await getCSharpDevKit()?.exports.serviceBroker.getProxy<IQueryExecutionService>(
-            Descriptors.projectQueryExecutionService
+        return BlazorDebugConfigurationProvider.isNet9OrNewerViaCsproj(projectPath);
+    }
+
+    private static async isNet9OrNewerViaDevKit(projectPath: string): Promise<boolean | undefined> {
+        const devKit = getCSharpDevKit();
+        if (!devKit) {
+            return undefined;
+        }
+        const proxy = await devKit.exports.serviceBroker.getProxy<IDebugTargetFrameworkService>(
+            targetFrameworkServiceDescriptor
         );
         if (!proxy) {
-            throw new Error('Unable to obtain required service from C# Dev Kit.');
+            return undefined;
         }
         try {
-            const result = await proxy.ExecuteQueryAsync(queryString);
-            const queryResult = JSON.parse(result) as QueryResult<Project>;
-            const pattern = /^net(\d+\.\d+)\b/;
-            if (queryResult && queryResult.Items) {
-                isNet9OrNewer = false;
-                queryResult.Items.forEach((project) => {
-                    project.ActiveConfigurations?.forEach((activeConfig) => {
-                        const match = activeConfig.BuildProperties[0].Value.match(pattern);
-                        if (match && match[1] >= 9) {
-                            isNet9OrNewer = true;
-                        }
-                    });
+            const tfmPattern = /^net(\d+)\.\d+/;
+            const infos = await new Promise<ProjectDebugTargetFrameworkInfo[]>((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error('Timeout')), 10000);
+                const observer = new Observer<ProjectDebugTargetFrameworkInfo[]>((value) => {
+                    clearTimeout(timeout);
+                    resolve(value);
                 });
-                return isNet9OrNewer;
+                proxy.subscribe(observer).catch((e) => {
+                    clearTimeout(timeout);
+                    reject(e);
+                });
+            });
+            for (const info of infos) {
+                if (projectPath !== '' && info.fullPath.toLowerCase() !== projectPath.toLowerCase()) {
+                    continue;
+                }
+                // Check debugTargetFramework
+                if (info.debugTargetFramework) {
+                    const match = info.debugTargetFramework.match(tfmPattern);
+                    if (match && parseInt(match[1]) >= 9) {
+                        return true;
+                    }
+                }
+                // Check all available target frameworks
+                for (const fw of info.availableTargetFrameworks ?? []) {
+                    const match = fw.framework.match(tfmPattern);
+                    if (match && parseInt(match[1]) >= 9) {
+                        return true;
+                    }
+                }
             }
-        } catch (err) {
-            throw new Error('Exception while talking to proxy: ' + err);
+            return false;
+        } catch {
+            return undefined;
         } finally {
             proxy?.dispose();
         }
-        return isNet9OrNewer;
+    }
+
+    private static async isNet9OrNewerViaCsproj(projectPath: string): Promise<boolean> {
+        const tfmPattern = /^net(\d+)\.\d+/;
+        const csprojFiles = await BlazorDebugConfigurationProvider.findCsprojFiles(projectPath);
+        for (const csproj of csprojFiles) {
+            const tfms = BlazorDebugConfigurationProvider.parseTfmsFromCsproj(csproj);
+            for (const tfm of tfms) {
+                const match = tfm.match(tfmPattern);
+                if (match && parseInt(match[1]) >= 9) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static async findCsprojFiles(projectPath: string): Promise<string[]> {
+        if (projectPath === '') {
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (!workspaceFolders) {
+                return [];
+            }
+            const results: string[] = [];
+            for (const folder of workspaceFolders) {
+                const folderCsprojs = await BlazorDebugConfigurationProvider.findCsprojFiles(folder.uri.fsPath);
+                results.push(...folderCsprojs);
+            }
+            return results;
+        }
+        // If the path is a .csproj file itself, return it directly
+        if (projectPath.endsWith('.csproj') && existsSync(projectPath)) {
+            return [projectPath];
+        }
+        // Otherwise treat it as a directory and search for .csproj files
+        try {
+            const entries = await promises.readdir(projectPath);
+            return entries.filter((e) => e.endsWith('.csproj')).map((e) => path.join(projectPath, e));
+        } catch {
+            return [];
+        }
+    }
+
+    private static parseTfmsFromCsproj(csprojPath: string): string[] {
+        try {
+            const content = readFileSync(csprojPath, 'utf-8');
+            // Match <TargetFramework>net9.0</TargetFramework>
+            const singleMatch = content.match(/<TargetFramework>(.*?)<\/TargetFramework>/);
+            if (singleMatch) {
+                return [singleMatch[1].trim()];
+            }
+            // Match <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+            const multiMatch = content.match(/<TargetFrameworks>(.*?)<\/TargetFrameworks>/);
+            if (multiMatch) {
+                return multiMatch[1].split(';').map((t) => t.trim());
+            }
+        } catch {
+            // If we can't read the file, fall through
+        }
+        return [];
     }
     private static async useVSDbg(projectPath: string): Promise<boolean> {
         const wasmConfig = vscode.workspace.getConfiguration('csharp');
