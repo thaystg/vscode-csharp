@@ -11,12 +11,19 @@ import * as vscode from 'vscode';
 import { ChromeBrowserFinder, EdgeBrowserFinder } from '@vscode/js-debug-browsers';
 import { RazorLogger } from '../razorLogger';
 import { ONLY_JS_DEBUG_NAME, MANAGED_DEBUG_NAME, JS_DEBUG_NAME, SERVER_APP_NAME } from './constants';
-import { onDidTerminateDebugSession } from './terminateDebugHandler';
+import { isValidEvent, onDidTerminateDebugSession } from './terminateDebugHandler';
 import path = require('path');
 import * as cp from 'child_process';
 import { getExtensionPath } from '../../../common';
 import { debugSessionTracker } from '../../../coreclrDebug/provisionalDebugSessionTracker';
 import { getCSharpDevKit } from '../../../utils/getCSharpDevKit';
+import { CSharpExtensionId } from '../../../constants/csharpExtensionId';
+import { DotNetRuntimeVersion } from '../../../lsptoolshost/dotnetRuntime/dotnetRuntimeExtensionResolver';
+import {
+    IDotnetAcquireContext,
+    IDotnetAcquireResult,
+    IDotnetFindPathContext,
+} from '../../../lsptoolshost/dotnetRuntime/dotnetRuntimeExtensionApi';
 import { IDisposable } from '@microsoft/servicehub-framework';
 import { Observer } from '@microsoft/servicehub-framework/js/src/jsonRpc/Observer';
 import { EventEmitter } from 'events';
@@ -154,6 +161,9 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
             await this.vscodeType.debug.startDebugging(folder, app);
             if (process.platform !== 'win32') {
                 const terminate = this.vscodeType.debug.onDidTerminateDebugSession(async (event) => {
+                    if (!isValidEvent(event.name)) {
+                        return;
+                    }
                     const blazorDevServer = 'blazor-devserver\\.dll';
                     const dir = folder && folder.uri && folder.uri.fsPath;
                     const regexEscapedDir = dir!.toLowerCase()!.replace(/\//g, '\\/');
@@ -297,12 +307,14 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
             const terminate = this.vscodeType.debug.onDidTerminateDebugSession(async (event) => {
                 if (process.platform !== 'win32') {
                     const blazorDevServer = 'blazor-devserver\\.dll';
-                    const dir = folder && folder.uri && folder.uri.fsPath;
-                    const regexEscapedDir = dir!.toLowerCase()!.replace(/\//g, '\\/');
-                    const launchedApp = configuration.hosted
-                        ? app.program
-                        : `${regexEscapedDir}.*${blazorDevServer}|${blazorDevServer}.*${regexEscapedDir}`;
-                    await onDidTerminateDebugSession(event, this.logger, launchedApp);
+                    const dir = folder?.uri?.fsPath;
+                    if (dir) {
+                        const regexEscapedDir = dir.toLowerCase().replace(/\//g, '\\/');
+                        const launchedApp = configuration.hosted
+                            ? app.program
+                            : `${regexEscapedDir}.*${blazorDevServer}|${blazorDevServer}.*${regexEscapedDir}`;
+                        await onDidTerminateDebugSession(event, this.logger, launchedApp);
+                    }
                     terminate.dispose();
                 }
                 this.vscodeType.debug.stopDebugging();
@@ -313,8 +325,50 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         return [inspectUriRet, portBrowserDebug];
     }
 
+    /**
+     * Acquires the dotnet runtime path from the .NET Runtime extension,
+     * falling back to the global dotnet if the extension is unavailable.
+     */
+    private static async acquireDotnetPath(): Promise<string> {
+        const findPathRequest: IDotnetFindPathContext = {
+            acquireContext: {
+                version: DotNetRuntimeVersion,
+                requestingExtensionId: CSharpExtensionId,
+                architecture: process.arch,
+                mode: 'aspnetcore',
+            },
+            versionSpecRequirement: 'greater_than_or_equal',
+            rejectPreviews: true,
+        };
+
+        try {
+            let acquireResult = await vscode.commands.executeCommand<IDotnetAcquireResult | undefined>(
+                'dotnet.findPath',
+                findPathRequest
+            );
+            if (acquireResult === undefined) {
+                const acquireContext: IDotnetAcquireContext = {
+                    version: DotNetRuntimeVersion.substring(0, DotNetRuntimeVersion.lastIndexOf('.')),
+                    requestingExtensionId: CSharpExtensionId,
+                    mode: 'aspnetcore',
+                };
+                acquireResult = await vscode.commands.executeCommand<IDotnetAcquireResult>(
+                    'dotnet.acquire',
+                    acquireContext
+                );
+            }
+            if (acquireResult?.dotnetPath) {
+                return acquireResult.dotnetPath;
+            }
+        } catch {
+            // Fall through to global dotnet
+        }
+
+        return process.platform === 'win32' ? 'dotnet.exe' : 'dotnet';
+    }
+
     private static async launchVsWebAssemblyBridge(urlStr: string): Promise<[string, number, number]> {
-        const dotnetPath = process.platform === 'win32' ? 'dotnet.exe' : 'dotnet';
+        const dotnetPath = await BlazorDebugConfigurationProvider.acquireDotnetPath();
         const devToolsUrl = `http://localhost:0`; // Browser debugging port address
         const spawnedProxyArgs = [
             `${BlazorDebugConfigurationProvider.getWebAssemblyWebBridgePath()}`,
@@ -330,6 +384,11 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         const cpOptions: cp.SpawnOptionsWithoutStdio = {
             detached: true,
             windowsHide: true,
+            env: {
+                ...process.env,
+                DOTNET_ROOT: path.dirname(dotnetPath),
+                DOTNET_MULTILEVEL_LOOKUP: '0',
+            },
         };
         let chunksProcessed = 0;
         let proxyICorDebugPort = -1;
@@ -342,6 +401,14 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
                 `Failed to spawn proxy: ${err.message}`
             );
             eventEmmiter.emit('vsWebAssemblyReady');
+        });
+        spawnedProxy.on('close', (code) => {
+            if (newUri === '') {
+                BlazorDebugConfigurationProvider.vsWebAssemblyBridgeOutputChannel.appendLine(
+                    `Proxy process exited with code ${code} before it was ready`
+                );
+                eventEmmiter.emit('vsWebAssemblyReady');
+            }
         });
         function handleData(stream: NodeJS.ReadableStream) {
             stream.on('data', (chunk) => {
@@ -377,14 +444,16 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
                             // Process may have already terminated
                         }
                     }
-                    BlazorDebugConfigurationProvider.pidsByUrl.set(urlStr, spawnedProxy.pid);
+                    if (spawnedProxy.pid !== undefined) {
+                        BlazorDebugConfigurationProvider.pidsByUrl.set(urlStr, spawnedProxy.pid);
+                    }
                     const url = new URL(proxyUrlString);
                     newUri = `${url.protocol.replace(`http`, `ws`)}//${url.host}{browserInspectUriPath}`;
                     eventEmmiter.emit('vsWebAssemblyReady');
                 }
             });
 
-            stream.on('err', (err) => {
+            stream.on('error', (err) => {
                 BlazorDebugConfigurationProvider.vsWebAssemblyBridgeOutputChannel.appendLine(err.toString());
                 eventEmmiter.emit('vsWebAssemblyReady');
             });
@@ -433,8 +502,9 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
                     reject(e);
                 });
             });
+            const normalizePath = (p: string) => p.replace(/[\\/]+/g, '/').toLowerCase();
             for (const info of infos) {
-                if (projectPath !== '' && info.fullPath.toLowerCase() !== projectPath.toLowerCase()) {
+                if (projectPath !== '' && normalizePath(info.fullPath) !== normalizePath(projectPath)) {
                     continue;
                 }
                 // Check debugTargetFramework

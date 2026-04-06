@@ -171,6 +171,9 @@ export class BaseVsDbgConfigurationProvider implements vscode.DebugConfiguration
                     debugConfiguration.program = programName;
                 } else {
                     const [assetsPath, programName] = await this.getAssetsPathAndProgram(folder);
+                    if (!assetsPath || !programName) {
+                        return undefined;
+                    }
                     debugConfiguration.monoDebuggerOptions.assetsPath = assetsPath;
                     debugConfiguration.program = programName;
                 }
