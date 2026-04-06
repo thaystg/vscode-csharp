@@ -72,17 +72,64 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
     private static readonly pidsByUrl = new Map<string, number | undefined>();
     private static readonly vsWebAssemblyBridgeOutputChannel = vscode.window.createOutputChannel('VsWebAssemblyBridge');
 
+    // Session tracking: captures sessions started during a Blazor debug launch
+    // so they can all be torn down together when any one terminates.
+    // Static because tryToUseVSDbgForMono (called by C# Dev Kit) is static.
+    private static isTrackingSessions = false;
+    private static readonly trackedSessionIds = new Set<string>();
+    private static readonly trackedSessionsById = new Map<string, vscode.DebugSession>();
+
     constructor(private readonly logger: RazorLogger, private readonly vscodeType: typeof vscode) {}
 
     public static register(logger: RazorLogger, vscodeType: typeof vscode) {
         const provider = new BlazorDebugConfigurationProvider(logger, vscodeType);
-        return vscodeType.debug.registerDebugConfigurationProvider('blazorwasm', provider);
+        const disposables: vscode.Disposable[] = [];
+
+        disposables.push(vscodeType.debug.registerDebugConfigurationProvider('blazorwasm', provider));
+
+        // Track sessions started during our Blazor launch sequence.
+        disposables.push(
+            vscodeType.debug.onDidStartDebugSession((session) => {
+                if (BlazorDebugConfigurationProvider.isTrackingSessions) {
+                    BlazorDebugConfigurationProvider.trackedSessionIds.add(session.id);
+                    BlazorDebugConfigurationProvider.trackedSessionsById.set(session.id, session);
+                }
+            })
+        );
+
+        // When any tracked session terminates, stop all remaining siblings.
+        disposables.push(
+            vscodeType.debug.onDidTerminateDebugSession(async (event) => {
+                if (!BlazorDebugConfigurationProvider.trackedSessionIds.has(event.id)) {
+                    return;
+                }
+                BlazorDebugConfigurationProvider.isTrackingSessions = false;
+                BlazorDebugConfigurationProvider.trackedSessionIds.delete(event.id);
+                BlazorDebugConfigurationProvider.trackedSessionsById.delete(event.id);
+                const sessionsToStop = [...BlazorDebugConfigurationProvider.trackedSessionsById.values()];
+                BlazorDebugConfigurationProvider.trackedSessionIds.clear();
+                BlazorDebugConfigurationProvider.trackedSessionsById.clear();
+                for (const session of sessionsToStop) {
+                    await vscodeType.debug.stopDebugging(session);
+                }
+            })
+        );
+
+        return vscode.Disposable.from(...disposables);
     }
 
     public async resolveDebugConfiguration(
         folder: vscode.WorkspaceFolder | undefined,
         configuration: vscode.DebugConfiguration
     ): Promise<vscode.DebugConfiguration | undefined> {
+        // Enable session tracking so that onDidStartDebugSession captures
+        // every session launched as part of this Blazor debug sequence.
+        // Tracking stays on until the first tracked session terminates,
+        // because sessions may start asynchronously after startDebugging resolves.
+        BlazorDebugConfigurationProvider.trackedSessionIds.clear();
+        BlazorDebugConfigurationProvider.trackedSessionsById.clear();
+        BlazorDebugConfigurationProvider.isTrackingSessions = true;
+
         /**
          * The Blazor WebAssembly app should only be launched if the
          * launch configuration is a launch request. Attach requests will
@@ -305,6 +352,9 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
             await this.vscodeType.debug.startDebugging(folder, app);
 
             const terminate = this.vscodeType.debug.onDidTerminateDebugSession(async (event) => {
+                if (!isValidEvent(event.name)) {
+                    return;
+                }
                 if (process.platform !== 'win32') {
                     const blazorDevServer = 'blazor-devserver\\.dll';
                     const dir = folder?.uri?.fsPath;
@@ -315,9 +365,8 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
                             : `${regexEscapedDir}.*${blazorDevServer}|${blazorDevServer}.*${regexEscapedDir}`;
                         await onDidTerminateDebugSession(event, this.logger, launchedApp);
                     }
-                    terminate.dispose();
                 }
-                this.vscodeType.debug.stopDebugging();
+                terminate.dispose();
             });
         } catch (error) {
             this.logger.logError('[DEBUGGER] Error when launching application: ', error as Error);
@@ -613,6 +662,12 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
     }
 
     public static async tryToUseVSDbgForMono(urlStr: string, projectPath: string): Promise<[string, number, number]> {
+        // Enable session tracking — C# Dev Kit calls this method directly
+        // (bypassing resolveDebugConfiguration), so we start tracking here.
+        BlazorDebugConfigurationProvider.trackedSessionIds.clear();
+        BlazorDebugConfigurationProvider.trackedSessionsById.clear();
+        BlazorDebugConfigurationProvider.isTrackingSessions = true;
+
         const useVSDbg = await BlazorDebugConfigurationProvider.useVSDbg(projectPath);
 
         if (useVSDbg) {
