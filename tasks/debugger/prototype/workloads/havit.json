@@ -17,56 +17,25 @@
         "readyMarker": "havitStartup"
     },
     "preparationTransitions": 2,
-    "comparison": {
-        "breaks": [
-            {
-                "sourceSuffix": "UrlHelper.cs",
-                "line": 16,
-                "localNames": ["url", "urlParts", "hashIndex"],
-                "localValues": {
-                    "hashIndex": "0"
-                },
-                "expandLocal": {
-                    "variable": "urlParts",
-                    "child": "[1]"
-                },
-                "caller": {
-                    "frameName": "DocPageNavigationItemsTracker.GetPageNavigationItems",
-                    "callerLocals": ["this", "url", "pageKey", "items"],
-                    "forbiddenLocals": ["urlParts", "hashIndex"],
-                    "thisMember": "_itemsByPage",
-                    "expectFragmentUrl": true
-                }
-            },
-            {
-                "sourceSuffix": "UrlHelper.cs",
-                "line": 30,
-                "localNames": ["url", "pageKey", "removedParts"],
-                "expandLocal": {
-                    "variable": "removedParts",
-                    "child": "[1]"
-                },
-                "caller": {
-                    "frameName": "DocPageNavigationItemsTracker.GetPageNavigationItems",
-                    "callerLocals": ["this", "url", "pageKey", "items"],
-                    "forbiddenLocals": ["removedParts"],
-                    "thisMember": "_itemsByPage",
-                    "expectFragmentUrl": true
-                }
-            }
-        ],
-        "stepOverTo": {
-            "sourceSuffix": "UrlHelper.cs",
-            "line": 31,
-            "localNames": ["url", "pageKey", "removedParts"]
-        },
-        "buildNote": "Comparison lines match macro-benchmarks 63ccb5b4 (two user breaks); the F10-mode stops below describe the 9ce0cb65 build."
-    },
     "extendedInspection": {
         "callerFrameName": "DocPageNavigationItemsTracker.",
         "callerLocals": ["this", "url", "pageKey"],
         "forbiddenLocals": ["hashIndex"],
-        "thisMember": "_itemsByPage"
+        "thisMember": "_itemsByPage",
+        "secondBreak": {
+            "sourceSuffix": "DocPageNavigationItemsTracker.cs",
+            "line": 31,
+            "localNames": ["url", "pageKey", "items"],
+            "callerFrameName": "OnThisPageNavigation.LoadItems",
+            "callerLocals": ["this", "sender", "eventArgs"],
+            "forbiddenLocals": ["pageKey", "items"],
+            "thisMember": "_items",
+            "stepOverTo": {
+                "sourceSuffix": "DocPageNavigationItemsTracker.cs",
+                "line": 32,
+                "localNames": ["url", "pageKey", "items"]
+            }
+        }
     },
     "stops": [
         { "sourceSuffix": "UrlHelper.cs", "line": 15, "localNames": ["url"] },

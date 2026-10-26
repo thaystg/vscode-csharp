@@ -7,20 +7,20 @@
     "url": "http://127.0.0.1:8000/index.html",
     "extendedInspection": {
         "notApplicable": true,
-        "notApplicableReason": "Debugger.Break is in static Main invoked by the runtime: no managed caller frame and no this."
-    },
-    "comparison": {
-        "breaks": [
-            { "sourceSuffix": "Program.cs", "line": 15, "localNames": ["args"], "localValues": { "args": "{string[0]}" } }
-        ],
-        "stepOverTo": { "sourceSuffix": "Program.cs", "line": 16, "localNames": ["args"], "localValues": { "args": "{string[0]}" } },
-        "notApplicable": {
-            "Expand Locals": "The only top-frame local (args, an empty string[]) is not expandable.",
-            "Select caller frame": "Debugger.Break is in static Main invoked by the runtime: no managed caller frame.",
-            "Load caller Locals": "No managed caller frame.",
-            "Expand caller `this`": "Static Main: no managed caller frame and no this.",
-            "Resume -> second user break": "The Small sample has a single Debugger.Break.",
-            "default": "The Small sample has a single Debugger.Break; second-break inspection does not apply."
+        "notApplicableReason": "Debugger.Break is in static Main invoked by the runtime: no managed caller frame and no this.",
+        "secondBreak": {
+            "sourceSuffix": "Program.cs",
+            "line": 33,
+            "localNames": ["secondMeaning"],
+            "localValues": { "secondMeaning": "42" },
+            "notApplicable": true,
+            "notApplicableReason": "Static SecondBreak is called only by the generated [DebuggerNonUserCode] JSExport stub: no user caller frame and no this.",
+            "stepOverTo": {
+                "sourceSuffix": "Program.cs",
+                "line": 34,
+                "localNames": ["secondMeaning"],
+                "localValues": { "secondMeaning": "42" }
+            }
         }
     },
     "stops": [

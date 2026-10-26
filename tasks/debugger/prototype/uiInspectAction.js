@@ -44,8 +44,8 @@ function matchesName(row, name) {
         (s) => s === name || s.startsWith(`${name} `) || s.startsWith(`${name},`) || s.startsWith(`${name}:`)
     );
 }
-function frameRow(model, name = spec.callerFrameName) {
-    return model.callStack.find((r) => r.visible && (r.label + ' ' + r.text).includes(name));
+function frameRow(model) {
+    return model.callStack.find((r) => r.visible && (r.label + ' ' + r.text).includes(spec.callerFrameName));
 }
 function variableRow(model, name) {
     return model.variables.find((r) => r.visible && matchesName(r, name));
@@ -63,38 +63,7 @@ const predicates = {
     expandThis: {
         thisMemberVisible: (m) => variableRow(m, 'this')?.expanded === 'true' && !!variableRow(m, spec.thisMember),
     },
-    // Comparison-workflow kinds (generic variable/frame actions); the kinds above are unchanged.
-    expandVariable: {
-        childVisible: (m) => variableRow(m, spec.variable)?.expanded === 'true' && !!variableRow(m, spec.child),
-    },
-    collapseVariable: {
-        collapsed: (m) => variableRow(m, spec.variable)?.expanded === 'false' && !variableRow(m, spec.child),
-    },
-    selectFrame: {
-        frameSelected: (m) => !!frameRow(m, spec.frameName)?.selected,
-    },
 };
-function actionPoint(model) {
-    switch (spec.kind) {
-        case 'selectCaller':
-            return frameRow(model)?.center;
-        case 'selectFrame':
-            return frameRow(model, spec.frameName)?.center;
-        case 'expandThis': {
-            const row = variableRow(model, 'this');
-            return row?.expanded === 'false' ? row.twistie : undefined;
-        }
-        case 'expandVariable': {
-            const row = variableRow(model, spec.variable);
-            return row?.expanded === 'false' ? row.twistie : undefined;
-        }
-        case 'collapseVariable': {
-            const row = variableRow(model, spec.variable);
-            return row?.expanded === 'true' ? row.twistie : undefined;
-        }
-    }
-    return undefined;
-}
 
 async function main() {
     const result = { spec, pollMs: POLL_MS, quietMs: QUIET_MS, boundMs: BOUND_MS, conditions: {} };
@@ -132,21 +101,15 @@ async function main() {
         const ready = Date.now() + 5000;
         do {
             before = await model();
-            point = actionPoint(before);
+            const row = spec.kind === 'selectCaller' ? frameRow(before) : variableRow(before, 'this');
+            point = spec.kind === 'selectCaller' ? row?.center : row?.expanded === 'false' ? row.twistie : undefined;
             if (point) break;
-            if (
-                spec.kind === 'expandVariable' &&
-                spec.ifAlreadyExpanded === 'report' &&
-                variableRow(before, spec.variable)?.expanded === 'true'
-            ) {
-                // VS Code restored this expansion automatically; report it instead of collapsing it with a click.
-                result.alreadyExpanded = true;
-                result.before = before;
-                return;
-            }
             await new Promise((resolve) => setTimeout(resolve, 50));
         } while (Date.now() < ready);
         result.before = before;
+        if (!point && spec.kind === 'expandThis' && variableRow(before, 'this')?.expanded === 'true') {
+            throw new Error('Caller this was already expanded before the click (expansion state retained from an earlier break).');
+        }
         if (!point) throw new Error(`The ${spec.kind} target row was not rendered in the existing view.`);
         await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y });
         result.actionEpochMs = Date.now();

@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { DebuggerWorkload } from './debuggerWorkload';
+import { CallerInspectionSpec, DebuggerStopExpectation, DebuggerWorkload } from './debuggerWorkload';
 import type { TimedDebuggerRequest } from './automaticDebuggerSteps';
 
 type Message = { session: string; message: Record<string, unknown>; at?: number };
@@ -19,7 +19,7 @@ export interface ExtendedInspectionContext {
     epochOffsetMs: number;
 }
 
-function requestsBetween(requests: TimedDebuggerRequest[], from: number, to: number) {
+export function requestsBetween(requests: TimedDebuggerRequest[], from: number, to: number) {
     return requests
         .filter((r) => r.startedAt >= from && r.startedAt <= to)
         .map((r) => ({
@@ -30,6 +30,48 @@ function requestsBetween(requests: TimedDebuggerRequest[], from: number, to: num
             finishedAtMs: r.finishedAt === undefined ? undefined : r.finishedAt - from,
             success: r.success,
         }));
+}
+
+/** Validates a managed stopped event body against the expected workload location. */
+export function assertStoppedAt(body: unknown, expected: DebuggerStopExpectation, label: string): string {
+    const b = body as { reason?: unknown; source?: { path?: unknown }; line?: unknown } | undefined;
+    if (
+        !b ||
+        typeof b.source?.path !== 'string' ||
+        !b.source.path.endsWith(expected.sourceSuffix) ||
+        b.line !== expected.line
+    ) {
+        throw new Error(
+            `${label} stopped at an unexpected location (expected ${expected.sourceSuffix}:${expected.line}): ${JSON.stringify(body)}`
+        );
+    }
+    return String(b.reason);
+}
+
+/**
+ * Splits VS Code's automatic top-frame refresh after a stop into the comparison's rows: threads, call stack
+ * (stackTrace), Locals scope (scopes) and Locals contents (variables), each measured from the given start.
+ */
+export function automaticInspectionBreakdown(
+    requests: TimedDebuggerRequest[],
+    stopAt: number,
+    completedAt: number,
+    start = stopAt
+) {
+    const window = requests.filter(
+        (r) => r.startedAt >= stopAt && r.startedAt <= completedAt && r.command !== 'next' && r.command !== 'continue'
+    );
+    const answered = (command: string) => {
+        const request = window.find((r) => r.command === command && r.finishedAt !== undefined);
+        return request ? request.finishedAt! - start : undefined;
+    };
+    return {
+        threadsAnsweredMs: answered('threads'),
+        callStackAnsweredMs: answered('stackTrace'),
+        localsScopeAnsweredMs: answered('scopes'),
+        localsVariablesAnsweredMs: answered('variables'),
+        dap: requestsBetween(window, stopAt, completedAt),
+    };
 }
 
 /** Launch, Debugger.Break pause and automatic top-frame Locals boundaries from already-recorded events. */
@@ -92,16 +134,16 @@ export function launchAndBreakTimings(
     };
 }
 
-/** Havit-only caller inspection at the final stop, driven through the Call Stack/Variables UI. */
+/** Caller inspection at the current stop, driven through the Call Stack/Variables UI with real mouse input. */
 export async function callerInspectionSequence(
-    workload: DebuggerWorkload,
+    spec: CallerInspectionSpec | undefined,
     prototype: string,
     run: string,
     messages: Message[],
     requests: TimedDebuggerRequest[],
-    context: ExtendedInspectionContext
+    context: ExtendedInspectionContext,
+    labelPrefix = 'inspect'
 ) {
-    const spec = workload.extendedInspection;
     if (!spec || spec.notApplicable) {
         return {
             notApplicable: ['Select caller frame', 'Load caller locals', 'Expand caller this'],
@@ -149,7 +191,7 @@ export async function callerInspectionSequence(
         return { ui, actionAt, stableAt, dap: requestsBetween(requests, actionAt - 5, stableAt) };
     }
 
-    const select = await act('inspect-select-caller', {
+    const select = await act(`${labelPrefix}-select-caller`, {
         kind: 'selectCaller',
         callerFrameName: spec.callerFrameName,
         callerLocals: spec.callerLocals,
@@ -176,7 +218,7 @@ export async function callerInspectionSequence(
             throw new Error(`Caller local ${name} missing from the DAP reply.`);
         }
     }
-    const expand = await act('inspect-expand-caller-this', { kind: 'expandThis', thisMember: spec.thisMember });
+    const expand = await act(`${labelPrefix}-expand-caller-this`, { kind: 'expandThis', thisMember: spec.thisMember });
     const members = responseFor(
         expand.actionAt - 5,
         'variables',
@@ -202,8 +244,9 @@ export async function callerInspectionSequence(
             dap: select.dap,
         },
         loadCallerLocals: {
-            definition:
-                'same click -> Variables view shows caller Locals (this, url, pageKey; no top-frame hashIndex) (first poll), stable 300 ms',
+            definition: `same click -> Variables view shows caller Locals (${spec.callerLocals!.join(', ')}${
+                spec.forbiddenLocals?.length ? `; no top-frame ${spec.forbiddenLocals.join(', ')}` : ''
+            }) (first poll), stable 300 ms`,
             actionToVisibleMs: visible(select, 'callerLocalsVisible'),
             actionToDapVariablesMs:
                 locals.request?.finishedAt === undefined ? undefined : locals.request.finishedAt - select.actionAt,

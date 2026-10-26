@@ -34,69 +34,67 @@ export interface DebuggerWorkload {
         expectedRows?: string[];
     };
     server?: { command: string; args: string[] };
-    extendedInspection?: {
-        notApplicable?: boolean;
-        notApplicableReason?: string;
-        callerFrameName?: string;
-        callerLocals?: string[];
-        callerLocalContains?: Record<string, string>;
-        forbiddenLocals?: string[];
-        thisMember?: string;
-    };
-    comparison?: ComparisonWorkflow;
+    // Workflow mode only (machine-config extendedInspection). The top-level caller fields apply to the first
+    // Debugger.Break (stops[0]); secondBreak describes the second user break reached by Resume.
+    extendedInspection?: CallerInspectionSpec & { secondBreak?: WorkflowSecondBreak };
 }
 
-/** Opt-in comparison workflow: user breaks, per-break inspection, resume between breaks, final Step Over. */
-export interface ComparisonBreak extends DebuggerStopExpectation {
-    expandLocal?: { variable: string; child: string };
-    caller?: {
-        frameName: string;
-        callerLocals: string[];
-        callerLocalContains?: Record<string, string>;
-        forbiddenLocals?: string[];
-        thisMember: string;
-        expectFragmentUrl?: boolean;
-    };
+export interface CallerInspectionSpec {
+    notApplicable?: boolean;
+    notApplicableReason?: string;
+    callerFrameName?: string;
+    callerLocals?: string[];
+    callerLocalContains?: Record<string, string>;
+    forbiddenLocals?: string[];
+    thisMember?: string;
 }
-export interface ComparisonWorkflow {
-    breaks: ComparisonBreak[];
+
+export interface WorkflowSecondBreak extends DebuggerStopExpectation, CallerInspectionSpec {
+    // The managed stop expected after Step Over from the second break.
     stepOverTo: DebuggerStopExpectation;
-    notApplicable?: Record<string, string>;
 }
 
-export function parseComparisonWorkflow(value: unknown): ComparisonWorkflow {
-    const config = value as Partial<ComparisonWorkflow> | undefined;
-    const stop = (s: unknown, label: string) => {
-        const e = s as Partial<DebuggerStopExpectation> | undefined;
-        if (
-            !e ||
-            typeof e.sourceSuffix !== 'string' ||
-            !Number.isInteger(e.line) ||
-            !Array.isArray(e.localNames) ||
-            !e.localNames.length
-        ) {
-            throw new Error(`Comparison workflow ${label} requires source, line and baseline local names.`);
-        }
-    };
-    if (!config || !Array.isArray(config.breaks) || config.breaks.length < 1 || config.breaks.length > 2) {
-        throw new Error('Comparison workflow requires one or two user breaks.');
+function validStop(stop: DebuggerStopExpectation | undefined): boolean {
+    return (
+        !!stop &&
+        typeof stop.sourceSuffix === 'string' &&
+        !!stop.sourceSuffix &&
+        Number.isInteger(stop.line) &&
+        stop.line >= 1 &&
+        Array.isArray(stop.localNames) &&
+        stop.localNames.length > 0 &&
+        stop.localNames.every((name) => typeof name === 'string' && !!name) &&
+        (stop.localValues === undefined ||
+            (typeof stop.localValues === 'object' &&
+                Object.values(stop.localValues).every((value) => typeof value === 'string')))
+    );
+}
+
+function validateCallerInspection(spec: CallerInspectionSpec, label: string): void {
+    if (spec.notApplicable === true) {
+        return;
     }
-    config.breaks.forEach((b, index) => {
-        stop(b, `break ${index + 1}`);
-        if (b.expandLocal && (typeof b.expandLocal.variable !== 'string' || typeof b.expandLocal.child !== 'string')) {
-            throw new Error('expandLocal requires variable and child names.');
-        }
-        if (
-            b.caller &&
-            (typeof b.caller.frameName !== 'string' ||
-                !Array.isArray(b.caller.callerLocals) ||
-                typeof b.caller.thisMember !== 'string')
-        ) {
-            throw new Error('caller requires frameName, callerLocals and thisMember.');
-        }
-    });
-    stop(config.stepOverTo, 'stepOverTo');
-    return config as ComparisonWorkflow;
+    if (
+        typeof spec.callerFrameName !== 'string' ||
+        !spec.callerFrameName ||
+        !Array.isArray(spec.callerLocals) ||
+        !spec.callerLocals.includes('this') ||
+        typeof spec.thisMember !== 'string' ||
+        !spec.thisMember
+    ) {
+        throw new Error(
+            `${label} caller inspection requires callerFrameName, callerLocals including this, and thisMember, or notApplicable.`
+        );
+    }
+}
+
+/** Workflow mode requires the second user break; F10 mode never reads it. */
+export function requireWorkflowSecondBreak(workload: DebuggerWorkload): WorkflowSecondBreak {
+    const second = workload.extendedInspection?.secondBreak;
+    if (!second) {
+        throw new Error('Workflow mode requires extendedInspection.secondBreak in the staged workload.');
+    }
+    return second;
 }
 
 export function parseDebuggerWorkload(value: unknown): DebuggerWorkload {
@@ -202,6 +200,18 @@ export function parseDebuggerWorkload(value: unknown): DebuggerWorkload {
             config.server.args.some((arg) => typeof arg !== 'string'))
     ) {
         throw new Error('Invalid owned server command.');
+    }
+    const second = config.extendedInspection?.secondBreak;
+    if (second !== undefined) {
+        validateCallerInspection(config.extendedInspection!, 'First break');
+        if (!validStop(second) || !validStop(second?.stepOverTo)) {
+            throw new Error('Second break and its Step Over target require source, positive line and baseline locals.');
+        }
+        validateCallerInspection(second, 'Second break');
+        const first = config.stops[0];
+        if (second.sourceSuffix === first.sourceSuffix && second.line === first.line) {
+            throw new Error('The second user break must be a different location from the first.');
+        }
     }
     return config as DebuggerWorkload;
 }

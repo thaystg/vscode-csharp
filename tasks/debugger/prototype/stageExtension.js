@@ -98,11 +98,6 @@ function stageExtension(config, host, manifest) {
             if (template.extendedInspection) {
                 template.extendedInspection.callerLocalContains = { url: `${url}#header-filtering` };
             }
-            for (const brk of template.comparison?.breaks ?? []) {
-                if (brk.caller?.expectFragmentUrl) {
-                    brk.caller.callerLocalContains = { url: `${url}#header-filtering` };
-                }
-            }
         }
         template.versions = manifest.versions;
         fs.writeFileSync(path.join(stage, 'workloads', `${selector}.json`), JSON.stringify(template, null, 2));

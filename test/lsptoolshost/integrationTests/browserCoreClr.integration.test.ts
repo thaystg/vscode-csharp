@@ -12,7 +12,6 @@ import { promisify } from 'util';
 import { CSharpExtensionExports } from '../../../src/csharpExtensionExports';
 import { assertRunnableWorkload, parseDebuggerWorkload } from './debuggerWorkload';
 import { measureAutomaticDebuggerSteps, TimedDebuggerRequest } from './automaticDebuggerSteps';
-import { measureComparisonWorkflow } from './comparisonWorkflow';
 
 const prototypeDirectory = process.env.WASM_PROTOTYPE_DIRECTORY;
 const testPrototype = prototypeDirectory ? test : test.skip;
@@ -50,10 +49,7 @@ testPrototype('The selected browser workload attaches and completes its requeste
     let userBreakObserved = false;
     let continuedAfterUserBreak = false;
     let browserDomObservation: unknown;
-    let automaticSteps:
-        | Awaited<ReturnType<typeof measureAutomaticDebuggerSteps>>
-        | Awaited<ReturnType<typeof measureComparisonWorkflow>>
-        | undefined;
+    let automaticSteps: Awaited<ReturnType<typeof measureAutomaticDebuggerSteps>> | undefined;
     let entryTriggered = false;
     let entryDomObservation: unknown;
     let historyNavigationObserved = false;
@@ -362,30 +358,17 @@ testPrototype('The selected browser workload attaches and completes its requeste
                     return;
                 }
                 if (inspectStepCapabilities) {
-                    automaticSteps =
-                        process.env.WASM_PROTOTYPE_WORKFLOW === 'comparison'
-                            ? await measureComparisonWorkflow(
-                                  session,
-                                  workload,
-                                  prototypeDirectory,
-                                  run,
-                                  messages,
-                                  timedRequests,
-                                  stopTimes,
-                                  pending,
-                                  { launchStartedAt: launchStartedAt!, epochOffsetMs }
-                              )
-                            : await measureAutomaticDebuggerSteps(
-                                  session,
-                                  workload,
-                                  prototypeDirectory,
-                                  run,
-                                  messages,
-                                  timedRequests,
-                                  stopTimes,
-                                  pending,
-                                  { launchStartedAt: launchStartedAt!, epochOffsetMs }
-                              );
+                    automaticSteps = await measureAutomaticDebuggerSteps(
+                        session,
+                        workload,
+                        prototypeDirectory,
+                        run,
+                        messages,
+                        timedRequests,
+                        stopTimes,
+                        pending,
+                        { launchStartedAt: launchStartedAt!, epochOffsetMs }
+                    );
                     stepCapabilitiesCheckPassed = true;
                     return;
                 }

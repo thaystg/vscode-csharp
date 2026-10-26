@@ -112,7 +112,6 @@ export interface MachineConfig {
     browserProfile?: string;
     diagnosticLogging?: boolean;
     extendedInspection?: boolean;
-    workflowSequence?: 'comparison';
     havitClosingAction?: 'stepOver' | 'continue';
 }
 export function verifiedConcordExecutable(config: MachineConfig, host: HostPlatform, manifest: SourceManifest): string {
@@ -237,9 +236,6 @@ export function loadMachineConfig(
     if (raw.diagnosticLogging !== undefined && typeof raw.diagnosticLogging !== 'boolean') {
         throw new Error('diagnosticLogging must be boolean.');
     }
-    if (raw.workflowSequence !== undefined && raw.workflowSequence !== 'comparison') {
-        throw new Error('workflowSequence must be comparison when set.');
-    }
     if (raw.extendedInspection !== undefined && typeof raw.extendedInspection !== 'boolean') {
         throw new Error('extendedInspection must be boolean.');
     }
@@ -347,7 +343,6 @@ export function loadMachineConfig(
         ...(browserProfile ? { browserProfile } : {}),
         ...(raw.diagnosticLogging === true ? { diagnosticLogging: true } : {}),
         ...(raw.extendedInspection === true ? { extendedInspection: true } : {}),
-        ...(raw.workflowSequence === 'comparison' ? { workflowSequence: 'comparison' as const } : {}),
         ...(raw.havitClosingAction ? { havitClosingAction: raw.havitClosingAction as 'stepOver' | 'continue' } : {}),
     };
 }

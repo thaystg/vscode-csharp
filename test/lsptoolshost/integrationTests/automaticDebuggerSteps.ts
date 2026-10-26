@@ -8,8 +8,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { DebuggerStopExpectation, DebuggerWorkload } from './debuggerWorkload';
-import { callerInspectionSequence, ExtendedInspectionContext, launchAndBreakTimings } from './extendedInspection';
+import { DebuggerStopExpectation, DebuggerWorkload, requireWorkflowSecondBreak } from './debuggerWorkload';
+import {
+    assertStoppedAt,
+    automaticInspectionBreakdown,
+    callerInspectionSequence,
+    ExtendedInspectionContext,
+    launchAndBreakTimings,
+    requestsBetween,
+} from './extendedInspection';
 
 export interface TimedDebuggerRequest {
     command: string;
@@ -214,7 +221,140 @@ export async function measureAutomaticDebuggerSteps(
                 })),
         };
     }
+    /** Thays' workflow: break 1 inspect + caller, Resume to break 2, inspect + caller, Step Over. No F10 steps. */
+    async function workflowSequence(ctx: ExtendedInspectionContext) {
+        const spec = workload.extendedInspection;
+        const second = requireWorkflowSecondBreak(workload);
+        const stoppedBody = (index: number) =>
+            messages.filter(({ message }) => message.type === 'event' && message.event === 'stopped')[index]?.message
+                .body;
+        const waitForStop = async (index: number, command: string, label: string) => {
+            const deadline = Date.now() + 15000;
+            while (stopTimes.length <= index && Date.now() < deadline) {
+                const failed = messages.find(
+                    ({ message }) => message.type === 'response' && message.command === command && !message.success
+                );
+                if (failed) {
+                    throw new Error(`${label} failed: ${JSON.stringify(failed.message)}`);
+                }
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            if (stopTimes.length <= index) {
+                throw new Error(`${label} produced no managed stop within 15 s.`);
+            }
+        };
+        const topFrame = (
+            index: number,
+            refresh: { completedAt: number; ui: { renderedUiObservedAtEpochMs: number } }
+        ) => ({
+            boundary: 'managed stopped event',
+            stoppedToAutomaticLocalsMs: refresh.completedAt - stopTimes[index],
+            stoppedToVisibleLocalsMs: refresh.ui.renderedUiObservedAtEpochMs - ctx.epochOffsetMs - stopTimes[index],
+            ...automaticInspectionBreakdown(requests, stopTimes[index], refresh.completedAt),
+        });
+
+        // 1-2: launch -> first Debugger.Break, automatic top-frame Locals and call stack.
+        const breakTimings = launchAndBreakTimings(workload, run, messages, requests, stopTimes, ctx);
+        const firstReason = assertStoppedAt(stoppedBody(0), workload.stops[0], 'First user break');
+        const first = await inspect(0, workload.stops[0]);
+        observed.push(first);
+        // 3: caller frame, caller Locals, caller this (real mouse input).
+        const firstCaller = await callerInspectionSequence(spec, prototype, run, messages, requests, ctx, 'break1');
+
+        // 4: Resume (Continue) -> second Debugger.Break.
+        const resumeStart = performance.now();
+        await vscode.commands.executeCommand('workbench.action.debug.continue', session.id);
+        await waitForStop(1, 'continue', 'Resume');
+        const secondReason = assertStoppedAt(stoppedBody(1), second, 'Second user break');
+        if (secondReason === 'step') {
+            throw new Error('Resume ended in a step-complete stop instead of the second user break.');
+        }
+        const resume = {
+            definition:
+                'workbench.action.debug.continue command -> managed stopped event validated at the second Debugger.Break',
+            commandToStopMs: stopTimes[1] - resumeStart,
+            stopReason: secondReason,
+            dap: requestsBetween(requests, resumeStart, stopTimes[1]),
+        };
+        // 5: repeat automatic inspection and caller actions at the second break.
+        const secondRefresh = await inspect(1, second);
+        observed.push(secondRefresh);
+        const secondCaller = await callerInspectionSequence(second, prototype, run, messages, requests, ctx, 'break2');
+
+        // 6: Step Over -> stopped (F10 fields recorded for this single workflow step).
+        const start = performance.now();
+        const epoch = Date.now();
+        await vscode.commands.executeCommand('workbench.action.debug.stepOver', session.id);
+        await waitForStop(2, 'next', 'Workflow Step Over');
+        const stepBody = stoppedBody(2) as { reason?: unknown } | undefined;
+        if (stepBody?.reason !== 'step') {
+            throw new Error(`Workflow Step Over stop is not step-complete: ${JSON.stringify(stepBody)}`);
+        }
+        assertStoppedAt(stepBody, second.stepOverTo, 'Workflow Step Over');
+        const stepRefresh = await inspect(2, second.stepOverTo);
+        observed.push(stepRefresh);
+        steps.push({
+            from: { sourceSuffix: second.sourceSuffix, line: second.line, localNames: second.localNames },
+            to: second.stepOverTo,
+            workflowStep: 'Step Over from the second user break',
+            requestStartedAt: start,
+            requestStartedAtEpochMs: epoch,
+            commandToStopMs: measurementEnabled ? stopTimes[2] - start : undefined,
+            commandToAutomaticInspectionMs: measurementEnabled ? stepRefresh.completedAt - start : undefined,
+            commandToVisibleRefreshObservationMs: measurementEnabled
+                ? stepRefresh.ui.renderedUiObservedAtEpochMs - epoch
+                : undefined,
+            measurementEnabled,
+            inspectionTimeoutMs: 30000,
+            inspectionQuiescenceMs: 300,
+            UIObservationIncludesPollingQuiescenceAndCapture: true,
+            baselineLocalsOnly: true,
+            expandedObjects: false,
+            explicitManagedEvaluationRequested: false,
+            automaticUiImplicitEvaluationExcluded: false,
+        });
+        const result: Record<string, unknown> = {
+            sequence: 'thays-workflow-v1',
+            userDirectedDeparture:
+                'User-directed workflow mode (debugger-performance-comparison.md): no F10 15->N steps; UI-driven caller inspection at both user breaks, Resume between them, then one Step Over.',
+            ...breakTimings,
+            firstBreak: {
+                stop: workload.stops[0],
+                stopReason: firstReason,
+                automaticTopFrame: topFrame(0, first),
+                callerInspection: firstCaller,
+            },
+            resumeToSecondBreak: resume,
+            secondBreak: {
+                stop: { sourceSuffix: second.sourceSuffix, line: second.line },
+                stopReason: secondReason,
+                automaticTopFrame: topFrame(1, secondRefresh),
+                callerInspection: secondCaller,
+            },
+            stepOver: {
+                definition: 'workbench.action.debug.stepOver command -> next managed step-complete stopped event',
+                to: second.stepOverTo,
+                commandToStopMs: stopTimes[2] - start,
+                commandToAutomaticLocalsMs: stepRefresh.completedAt - start,
+                commandToVisibleLocalsMs: stepRefresh.ui.renderedUiObservedAtEpochMs - epoch,
+                dap: requestsBetween(requests, start, stepRefresh.completedAt),
+            },
+        };
+        const closing = process.env.WASM_PROTOTYPE_CLOSING_ACTION;
+        if (closing === 'stepOver' || closing === 'continue') {
+            result.closingAction = await closeFinalPause(closing);
+        }
+        return result;
+    }
     try {
+        if (extendedEnabled) {
+            if (!context) {
+                throw new Error('Extended inspection requires launch timing context.');
+            }
+            // Workflow mode replaces the F10 sequence entirely; F10 mode below is unchanged.
+            extendedActions = await workflowSequence(context);
+            return { steps, observed, automaticUiOnly: false, extendedActions };
+        }
         observed.push(await inspect(0, workload.stops[0]));
         for (let index = 1; index < workload.stops.length; index++) {
             const start = performance.now();
@@ -262,49 +402,6 @@ export async function measureAutomaticDebuggerSteps(
                     explicitManagedEvaluationRequested: false,
                     automaticUiImplicitEvaluationExcluded: false,
                 });
-            }
-        }
-        if (extendedEnabled) {
-            if (!context) {
-                throw new Error('Extended inspection requires launch timing context.');
-            }
-            // Runs only after the final stop's existing automatic inspection, so F10 samples are unperturbed.
-            const breakTimings = launchAndBreakTimings(workload, run, messages, requests, stopTimes, context);
-            const topFrameLocals = (
-                observed as { completedAt: number; ui: { renderedUiObservedAtEpochMs: number } }[]
-            ).map((o, index) => ({
-                stopIndex: index,
-                line: workload.stops[index].line,
-                boundary: index === 0 ? 'managed stopped event' : 'Step Over command',
-                stoppedToAutomaticLocalsMs: o.completedAt - stopTimes[index],
-                commandToAutomaticLocalsMs: index === 0 ? undefined : o.completedAt - commandStarts[index],
-                stoppedToVisibleLocalsMs: o.ui.renderedUiObservedAtEpochMs - context.epochOffsetMs - stopTimes[index],
-                commandToVisibleLocalsMs:
-                    index === 0
-                        ? undefined
-                        : o.ui.renderedUiObservedAtEpochMs - context.epochOffsetMs - commandStarts[index],
-            }));
-            extendedActions = {
-                userDirectedDeparture:
-                    'User-authorized departure from measurement.md: UI-driven caller-frame selection and object expansion after the final stop.',
-                ...breakTimings,
-                expandTopFrameLocals: {
-                    label: 'automatic top-frame Locals population; no expandable top-frame variable exists',
-                    duplicatesStepInspectionField: true,
-                    perStop: topFrameLocals,
-                },
-            };
-            extendedActions.callerInspection = await callerInspectionSequence(
-                workload,
-                prototype,
-                run,
-                messages,
-                requests,
-                context
-            );
-            const closing = process.env.WASM_PROTOTYPE_CLOSING_ACTION;
-            if (closing === 'stepOver' || closing === 'continue') {
-                extendedActions.closingAction = await closeFinalPause(closing);
             }
         }
         return { steps, observed, automaticUiOnly: !extendedEnabled, extendedActions };
