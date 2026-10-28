@@ -63,6 +63,11 @@ const predicates = {
     expandThis: {
         thisMemberVisible: (m) => variableRow(m, 'this')?.expanded === 'true' && !!variableRow(m, spec.thisMember),
     },
+    // Workflow change (unscored): collapse the inspected caller `this` so VS Code has no expansion state to restore
+    // (and func-eval) for a same-path `this` at the next stop.
+    collapseThis: {
+        thisCollapsed: (m) => variableRow(m, 'this')?.expanded === 'false' && !variableRow(m, spec.thisMember),
+    },
 };
 
 async function main() {
@@ -102,7 +107,8 @@ async function main() {
         do {
             before = await model();
             const row = spec.kind === 'selectCaller' ? frameRow(before) : variableRow(before, 'this');
-            point = spec.kind === 'selectCaller' ? row?.center : row?.expanded === 'false' ? row.twistie : undefined;
+            const actionable = spec.kind === 'collapseThis' ? 'true' : 'false';
+            point = spec.kind === 'selectCaller' ? row?.center : row?.expanded === actionable ? row.twistie : undefined;
             if (point) break;
             await new Promise((resolve) => setTimeout(resolve, 50));
         } while (Date.now() < ready);

@@ -13,9 +13,11 @@ import {
     assertStoppedAt,
     automaticInspectionBreakdown,
     callerInspectionSequence,
+    collapseCallerThis,
     ExtendedInspectionContext,
     launchAndBreakTimings,
     requestsBetween,
+    topThisRequestsBefore,
 } from './extendedInspection';
 
 export interface TimedDebuggerRequest {
@@ -260,6 +262,12 @@ export async function measureAutomaticDebuggerSteps(
         observed.push(first);
         // 3: caller frame, caller Locals, caller this (real mouse input).
         const firstCaller = await callerInspectionSequence(spec, prototype, run, messages, requests, ctx, 'break1');
+        // WORKFLOW CHANGE (unscored, 2026-10-28): collapse caller `this` so nothing is left for VS Code to
+        // auto-restore (and func-eval) at break 2.
+        const firstCollapse =
+            spec && !spec.notApplicable
+                ? await collapseCallerThis(spec, prototype, run, requests, ctx, 'break1')
+                : undefined;
 
         // 4: Resume (Continue) -> second Debugger.Break.
         const resumeStart = performance.now();
@@ -279,7 +287,41 @@ export async function measureAutomaticDebuggerSteps(
         // 5: repeat automatic inspection and caller actions at the second break.
         const secondRefresh = await inspect(1, second);
         observed.push(secondRefresh);
-        const secondCaller = await callerInspectionSequence(second, prototype, run, messages, requests, ctx, 'break2');
+        // Order guard: VS Code must not have requested top-frame `this` before the caller select (Concord
+        // frame-identity-after-func-eval trigger). Checked before the click and again up to the recorded click time.
+        const orderCheck = (to: number) => topThisRequestsBefore(requests, secondRefresh.variables, stopTimes[1], to);
+        const orderFailure = (check: ReturnType<typeof orderCheck>) =>
+            new Error(
+                `Order guard: VS Code requested top-frame this (variables ${check.topThisVariablesReference}) before the break-2 caller select ${JSON.stringify(check.requestsBeforeCallerSelect)}.`
+            );
+        const secondOrderBeforeClick = orderCheck(performance.now());
+        if (!second.notApplicable && !secondOrderBeforeClick.ok) {
+            throw orderFailure(secondOrderBeforeClick);
+        }
+        let secondCaller;
+        let callerError: unknown;
+        try {
+            secondCaller = await callerInspectionSequence(second, prototype, run, messages, requests, ctx, 'break2');
+        } catch (error) {
+            callerError = error;
+        }
+        const selectFile = path.join(run, 'break2-select-caller.json');
+        const clickAt = fs.existsSync(selectFile)
+            ? JSON.parse(fs.readFileSync(selectFile, 'utf8')).actionEpochMs - ctx.epochOffsetMs
+            : undefined;
+        if (!second.notApplicable && clickAt !== undefined && Number.isFinite(clickAt)) {
+            const atClick = orderCheck(clickAt);
+            fs.writeFileSync(path.join(run, 'break2-order-guard.json'), JSON.stringify(atClick, null, 2));
+            if (!atClick.ok) {
+                throw orderFailure(atClick);
+            }
+        }
+        if (callerError !== undefined) {
+            throw callerError;
+        }
+        const secondOrder = second.notApplicable
+            ? { notApplicable: true }
+            : JSON.parse(fs.readFileSync(path.join(run, 'break2-order-guard.json'), 'utf8'));
 
         // 6: Step Over -> stopped (F10 fields recorded for this single workflow step).
         const start = performance.now();
@@ -314,21 +356,23 @@ export async function measureAutomaticDebuggerSteps(
             automaticUiImplicitEvaluationExcluded: false,
         });
         const result: Record<string, unknown> = {
-            sequence: 'thays-workflow-v1',
+            sequence: 'workflow-v2-collapse-break1-caller-this',
             userDirectedDeparture:
-                'User-directed workflow mode (debugger-performance-comparison.md): no F10 15->N steps; UI-driven caller inspection at both user breaks, Resume between them, then one Step Over.',
+                'User-directed workflow mode based on debugger-performance-comparison.md (equivalence to that workflow unverified): no F10 15->N steps; UI-driven caller inspection at both user breaks, Resume between them, then one Step Over. WORKFLOW CHANGE 2026-10-28: break-1 caller `this` is collapsed (unscored) before Resume; second-break rows are not comparable with thays-workflow-v1 runs.',
             ...breakTimings,
             firstBreak: {
                 stop: workload.stops[0],
                 stopReason: firstReason,
                 automaticTopFrame: topFrame(0, first),
                 callerInspection: firstCaller,
+                ...(firstCollapse ? { collapseCallerThis: firstCollapse } : {}),
             },
             resumeToSecondBreak: resume,
             secondBreak: {
                 stop: { sourceSuffix: second.sourceSuffix, line: second.line },
                 stopReason: secondReason,
                 automaticTopFrame: topFrame(1, secondRefresh),
+                orderGuard: secondOrder,
                 callerInspection: secondCaller,
             },
             stepOver: {

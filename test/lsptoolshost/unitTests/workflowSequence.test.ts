@@ -5,7 +5,11 @@
 
 import { describe, expect, test } from '@jest/globals';
 import { parseDebuggerWorkload, requireWorkflowSecondBreak } from '../integrationTests/debuggerWorkload';
-import { assertStoppedAt, automaticInspectionBreakdown } from '../integrationTests/extendedInspection';
+import {
+    assertStoppedAt,
+    automaticInspectionBreakdown,
+    topThisRequestsBefore,
+} from '../integrationTests/extendedInspection';
 import type { TimedDebuggerRequest } from '../integrationTests/automaticDebuggerSteps';
 
 const havitStops = [15, 16, 18, 19, 20].map((line) => ({ sourceSuffix: 'UrlHelper.cs', line, localNames: ['url'] }));
@@ -147,5 +151,39 @@ describe('Automatic inspection breakdown', () => {
         const breakdown = automaticInspectionBreakdown([request('stackTrace', 1, 101)], 100, 600);
         expect(breakdown.callStackAnsweredMs).toBeUndefined();
         expect(breakdown.dap).toHaveLength(1);
+    });
+});
+
+describe('Break-2 order guard (top-frame this before caller select)', () => {
+    const variables = (sequence: number, startedAt: number, variablesReference: number): TimedDebuggerRequest => ({
+        command: 'variables',
+        sequence,
+        startedAt,
+        finishedAt: startedAt + 5,
+        success: true,
+        arguments: { variablesReference },
+    });
+    const topLocals = [
+        { name: 'this', variablesReference: 1001 },
+        { name: 'url', variablesReference: 0 },
+    ];
+    test('passes when VS Code only refreshed top Locals before the click (sc1000 v1000 then caller)', () => {
+        const check = topThisRequestsBefore([variables(19, 110, 1000), variables(22, 700, 1004)], topLocals, 100, 600);
+        expect(check).toEqual({ topThisVariablesReference: 1001, requestsBeforeCallerSelect: [], ok: true });
+    });
+    test('fails on the g4/b7099245ce82 signature: variables(top this) before the caller click', () => {
+        const check = topThisRequestsBefore([variables(19, 110, 1000), variables(20, 130, 1001)], topLocals, 100, 600);
+        expect(check.ok).toBe(false);
+        expect(check.requestsBeforeCallerSelect).toEqual([{ sequence: 20, startedAtMs: 30 }]);
+    });
+    test('ignores a top this request after the click and requests before the stop', () => {
+        const check = topThisRequestsBefore([variables(9, 50, 1001), variables(30, 650, 1001)], topLocals, 100, 600);
+        expect(check.ok).toBe(true);
+    });
+    test('matches a typed this row and treats a static frame (no this) as passing', () => {
+        const typed = [{ name: 'this [DocPageNavigationItemsTracker]', variablesReference: 1001 }];
+        expect(topThisRequestsBefore([variables(20, 130, 1001)], typed, 100, 600).ok).toBe(false);
+        const statik = topThisRequestsBefore([variables(20, 130, 1001)], [{ name: 'secondMeaning' }], 100, 600);
+        expect(statik).toEqual({ topThisVariablesReference: undefined, requestsBeforeCallerSelect: [], ok: true });
     });
 });

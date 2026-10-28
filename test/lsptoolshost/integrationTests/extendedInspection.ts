@@ -134,6 +134,89 @@ export function launchAndBreakTimings(
     };
 }
 
+/**
+ * Break-2 order evidence: variables requests for the top-frame `this` that VS Code issued between the stop and the
+ * caller-row click. Expanding top `this` runs a func-eval that neuters DBI frames, after which Concord cannot
+ * evaluate the caller's arguments (known Concord frame-identity bug; this check detects its trigger, it does not fix it).
+ */
+export function topThisRequestsBefore(
+    requests: TimedDebuggerRequest[],
+    topLocals: { name: string; variablesReference?: number }[],
+    from: number,
+    to: number
+) {
+    const topThis = topLocals.find((v) => v.name === 'this' || v.name.startsWith('this '));
+    const reference = topThis?.variablesReference || undefined;
+    const early =
+        reference === undefined
+            ? []
+            : requests
+                  .filter(
+                      (r) =>
+                          r.command === 'variables' &&
+                          r.arguments?.variablesReference === reference &&
+                          r.startedAt >= from &&
+                          r.startedAt < to
+                  )
+                  .map((r) => ({ sequence: r.sequence, startedAtMs: r.startedAt - from }));
+    return { topThisVariablesReference: reference, requestsBeforeCallerSelect: early, ok: early.length === 0 };
+}
+
+async function uiAction(
+    prototype: string,
+    run: string,
+    requests: TimedDebuggerRequest[],
+    context: ExtendedInspectionContext,
+    label: string,
+    uiSpec: Record<string, unknown>
+) {
+    const output = path.join(run, label);
+    await promisify(execFile)(
+        process.env.WASM_PROTOTYPE_NODE!,
+        [
+            path.join(prototype, 'uiInspectAction.js'),
+            process.env.WASM_PROTOTYPE_UI_PORT!,
+            output,
+            JSON.stringify(uiSpec),
+        ],
+        { timeout: 45000 }
+    );
+    const ui = JSON.parse(fs.readFileSync(`${output}.json`, 'utf8'));
+    const actionAt = ui.actionEpochMs - context.epochOffsetMs;
+    const stableAt =
+        Math.max(
+            ...Object.values(ui.conditions as Record<string, { stableEpochMs: number }>).map((c) => c.stableEpochMs)
+        ) - context.epochOffsetMs;
+    return { ui, actionAt, stableAt, dap: requestsBetween(requests, actionAt - 5, stableAt) };
+}
+
+/**
+ * WORKFLOW CHANGE (unscored): collapse the caller `this` expanded by callerInspectionSequence, through the real
+ * twistie, and wait until the Variables view shows it collapsed (300 ms quiet).
+ */
+export async function collapseCallerThis(
+    spec: CallerInspectionSpec,
+    prototype: string,
+    run: string,
+    requests: TimedDebuggerRequest[],
+    context: ExtendedInspectionContext,
+    labelPrefix: string
+) {
+    const collapse = await uiAction(prototype, run, requests, context, `${labelPrefix}-collapse-caller-this`, {
+        kind: 'collapseThis',
+        thisMember: spec.thisMember,
+    });
+    return {
+        unscored: true,
+        workflowChange:
+            'Added 2026-10-28: collapse caller `this` after its measurement so VS Code does not restore the expansion (and func-eval top-frame `this`) at the next stop.',
+        definition: `mouse click on the expanded this twistie -> this collapsed and ${spec.thisMember} row gone (first poll), stable 300 ms`,
+        actionToCollapsedMs:
+            collapse.ui.conditions.thisCollapsed.firstVisibleEpochMs - context.epochOffsetMs - collapse.actionAt,
+        dap: collapse.dap,
+    };
+}
+
 /** Caller inspection at the current stop, driven through the Call Stack/Variables UI with real mouse input. */
 export async function callerInspectionSequence(
     spec: CallerInspectionSpec | undefined,
@@ -171,24 +254,7 @@ export async function callerInspectionSequence(
         return { request, response };
     };
     async function act(label: string, uiSpec: Record<string, unknown>) {
-        const output = path.join(run, label);
-        await promisify(execFile)(
-            process.env.WASM_PROTOTYPE_NODE!,
-            [
-                path.join(prototype, 'uiInspectAction.js'),
-                process.env.WASM_PROTOTYPE_UI_PORT!,
-                output,
-                JSON.stringify(uiSpec),
-            ],
-            { timeout: 45000 }
-        );
-        const ui = JSON.parse(fs.readFileSync(`${output}.json`, 'utf8'));
-        const actionAt = ui.actionEpochMs - context.epochOffsetMs;
-        const stableAt =
-            Math.max(
-                ...Object.values(ui.conditions as Record<string, { stableEpochMs: number }>).map((c) => c.stableEpochMs)
-            ) - context.epochOffsetMs;
-        return { ui, actionAt, stableAt, dap: requestsBetween(requests, actionAt - 5, stableAt) };
+        return uiAction(prototype, run, requests, context, label, uiSpec);
     }
 
     const select = await act(`${labelPrefix}-select-caller`, {
