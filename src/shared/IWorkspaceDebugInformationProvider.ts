@@ -3,13 +3,16 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Uri } from 'vscode';
+import { CancellationToken, Uri } from 'vscode';
 
 export interface IWorkspaceDebugInformationProvider {
     /**
      * Get information from the workspace required to create and manage debug configurations.
      */
-    getWorkspaceDebugInformation(workspacePath: Uri): Promise<ProjectDebugInformation[] | undefined>;
+    getWorkspaceDebugInformation(
+        workspacePath: Uri,
+        cancellationToken?: CancellationToken
+    ): Promise<ProjectDebugInformation[] | undefined>;
 }
 
 export interface ProjectDebugInformation {

@@ -16,6 +16,7 @@ import {
 } from '../shared/processPicker';
 import { PlatformInformation } from './platform';
 import { getCSharpDevKit } from '../utils/getCSharpDevKit';
+import { BlazorDebugConfigurationProvider } from '../razor/src/blazorDebug/blazorDebugConfigurationProvider';
 import {
     ActionOption,
     showErrorMessageWithOptions,
@@ -155,11 +156,34 @@ export class BaseVsDbgConfigurationProvider implements vscode.DebugConfiguration
             }
         }
         if (
-            debugConfiguration.type === 'monovsdbg_wasm' &&
-            debugConfiguration.monoDebuggerOptions.platform === 'browser' &&
+            (debugConfiguration.type === 'monovsdbg_wasm' || debugConfiguration.type === 'coreclr_wasm') &&
+            (debugConfiguration.monoDebuggerOptions?.platform?.split(';').includes('browser') ||
+                debugConfiguration.coreClrMobileDebuggerOptions?.platform?.split(';').includes('browser')) &&
             this.isDotnetWorkspaceConfigurationProvider()
         ) {
-            if (folder && debugConfiguration.monoDebuggerOptions.assetsPath == null) {
+            if (debugConfiguration.type === 'monovsdbg_wasm') {
+                const useCoreClr = await BlazorDebugConfigurationProvider.isCoreClrRuntime(folder?.uri.fsPath ?? '');
+                if (useCoreClr) {
+                    debugConfiguration.type = 'coreclr_wasm';
+                    debugConfiguration.coreClrMobileDebuggerOptions = debugConfiguration.monoDebuggerOptions;
+                    delete debugConfiguration.monoDebuggerOptions;
+                    const platform = debugConfiguration.coreClrMobileDebuggerOptions.platform;
+                    if (!platform.split(';').includes('x64')) {
+                        debugConfiguration.coreClrMobileDebuggerOptions.platform = `${platform};x64`;
+                    }
+                }
+            }
+
+            if (process.env.VSCODE_CSHARP_WASMDBG_CONCORD) {
+                debugConfiguration.debugServer ??= 4711;
+            }
+
+            const debuggerOptions =
+                debugConfiguration.type === 'coreclr_wasm'
+                    ? debugConfiguration.coreClrMobileDebuggerOptions
+                    : debugConfiguration.monoDebuggerOptions;
+
+            if (folder && debuggerOptions.assetsPath == null) {
                 const csharpDevKitExtension = getCSharpDevKit();
                 if (csharpDevKitExtension === undefined) {
                     const result = await this.getNet9WasmAssetsPathAndProgram(folder);
@@ -167,14 +191,14 @@ export class BaseVsDbgConfigurationProvider implements vscode.DebugConfiguration
                         return undefined;
                     }
                     const [assetsPath, programName] = result;
-                    debugConfiguration.monoDebuggerOptions.assetsPath = assetsPath;
+                    debuggerOptions.assetsPath = assetsPath;
                     debugConfiguration.program = programName;
                 } else {
                     const [assetsPath, programName] = await this.getAssetsPathAndProgram(folder);
                     if (!assetsPath || !programName) {
                         return undefined;
                     }
-                    debugConfiguration.monoDebuggerOptions.assetsPath = assetsPath;
+                    debuggerOptions.assetsPath = assetsPath;
                     debugConfiguration.program = programName;
                 }
                 if (debugConfiguration.program == null) {

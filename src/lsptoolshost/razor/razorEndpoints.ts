@@ -42,6 +42,7 @@ import { FormattingHandler } from '../../razor/src/formatting/formattingHandler'
 import { HtmlDocument } from './htmlDocument';
 import { HtmlForwardedRequest } from './htmlForwardedRequest';
 import { BlazorDebugConfigurationProvider } from '../../razor/src/blazorDebug/blazorDebugConfigurationProvider';
+import { RoslynWorkspaceDebugInformationProvider } from '../debugger/roslynWorkspaceDebugConfigurationProvider';
 import { ShowGeneratedDocumentCommand } from './showGeneratedDocumentCommand';
 import { RazorLanguageConfiguration } from '../../razor/src/razorLanguageConfiguration';
 
@@ -54,7 +55,13 @@ export function registerRazorEndpoints(
     initializeRazorToStringOverrides();
     registerCohostingEndpoints();
 
-    context.subscriptions.push(BlazorDebugConfigurationProvider.register(outputChannel, vscode));
+    context.subscriptions.push(
+        BlazorDebugConfigurationProvider.register(
+            outputChannel,
+            vscode,
+            new RoslynWorkspaceDebugInformationProvider(roslynLanguageServer, outputChannel)
+        )
+    );
     context.subscriptions.push(ShowGeneratedDocumentCommand.register(roslynLanguageServer));
 
     const languageConfiguration = new RazorLanguageConfiguration();

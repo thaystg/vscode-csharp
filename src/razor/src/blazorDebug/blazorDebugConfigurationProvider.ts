@@ -3,13 +3,16 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { promises, readFileSync, existsSync } from 'fs';
+import { promises, readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
+import { randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
 import * as vscode from 'vscode';
 import { ChromeBrowserFinder, EdgeBrowserFinder } from '@vscode/js-debug-browsers';
 import { ONLY_JS_DEBUG_NAME, MANAGED_DEBUG_NAME, JS_DEBUG_NAME, SERVER_APP_NAME } from './constants';
 import { isValidEvent, onDidTerminateDebugSession } from './terminateDebugHandler';
+import { findBrowserDebugPort, getCoreClrBrowserProgram, parseBrowserBridgeReady } from './browserBridge';
+import type { IWorkspaceDebugInformationProvider } from '../../../shared/IWorkspaceDebugInformationProvider';
 import path = require('path');
 import * as cp from 'child_process';
 import { getExtensionPath } from '../../../common';
@@ -78,11 +81,16 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
 
     constructor(
         private readonly logger: vscode.LogOutputChannel,
-        private readonly vscodeType: typeof vscode
+        private readonly vscodeType: typeof vscode,
+        private readonly workspaceDebugInfoProvider?: IWorkspaceDebugInformationProvider
     ) {}
 
-    public static register(logger: vscode.LogOutputChannel, vscodeType: typeof vscode) {
-        const provider = new BlazorDebugConfigurationProvider(logger, vscodeType);
+    public static register(
+        logger: vscode.LogOutputChannel,
+        vscodeType: typeof vscode,
+        workspaceDebugInfoProvider?: IWorkspaceDebugInformationProvider
+    ) {
+        const provider = new BlazorDebugConfigurationProvider(logger, vscodeType, workspaceDebugInfoProvider);
         const disposables: vscode.Disposable[] = [];
 
         disposables.push(vscodeType.debug.registerDebugConfigurationProvider('blazorwasm', provider));
@@ -120,7 +128,8 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
 
     public async resolveDebugConfiguration(
         folder: vscode.WorkspaceFolder | undefined,
-        configuration: vscode.DebugConfiguration
+        configuration: vscode.DebugConfiguration,
+        cancellationToken?: vscode.CancellationToken
     ): Promise<vscode.DebugConfiguration | undefined> {
         const debugFolder = BlazorDebugConfigurationProvider.resolveDebugFolder(folder, configuration);
         this.logger.info(
@@ -182,7 +191,8 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
                 debugFolder,
                 configuration,
                 inspectUri,
-                url
+                url,
+                cancellationToken
             );
             debugConfigurations.push(...browserConfigurations);
         }
@@ -323,35 +333,183 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         folder: vscode.WorkspaceFolder | undefined,
         configuration: vscode.DebugConfiguration,
         inspectUri: string,
-        url: string
+        url: string,
+        cancellationToken?: vscode.CancellationToken
     ): Promise<vscode.DebugConfiguration[]> {
         const debugConfigurations: vscode.DebugConfiguration[] = [];
         const projectPath = BlazorDebugConfigurationProvider.resolveProjectPath(folder, configuration);
         const useVSDbg = await BlazorDebugConfigurationProvider.useVSDbg(projectPath);
         let portBrowserDebug = -1;
         if (useVSDbg) {
-            const managedDebugConfiguration = await this.createManagedDebugConfigurationOnBrowser(configuration, url);
+            const managedDebugConfiguration = await this.createManagedDebugConfigurationOnBrowser(
+                configuration,
+                url,
+                projectPath,
+                folder,
+                cancellationToken
+            );
             inspectUri = managedDebugConfiguration.inspectUri;
             portBrowserDebug = managedDebugConfiguration.portBrowserDebug;
-            try {
-                this.logger.info(
-                    `[DEBUGGER] Starting Blazor managed debug configuration: ${BlazorDebugConfigurationProvider.stringifyDebugConfiguration(
-                        managedDebugConfiguration.app
-                    )}`
-                );
-                const didStart = await this.vscodeType.debug.startDebugging(folder, managedDebugConfiguration.app);
-                if (!didStart) {
-                    this.logger.warn(
-                        `[DEBUGGER] Blazor managed debug configuration did not start: ${BlazorDebugConfigurationProvider.stringifyDebugConfiguration(
+            const bridgeToken = managedDebugConfiguration.bridgeToken;
+            const preloadToken =
+                managedDebugConfiguration.app.type === 'coreclr_wasm' && process.env.DOTNET_DbgLocalMetadataPath
+                    ? randomUUID()
+                    : undefined;
+            if (preloadToken) {
+                managedDebugConfiguration.app.localMetadataPreloadToken = preloadToken;
+            }
+            const startManagedDebugging = async () => {
+                try {
+                    this.logger.info(
+                        `[DEBUGGER] Starting Blazor managed debug configuration: ${BlazorDebugConfigurationProvider.stringifyDebugConfiguration(
                             managedDebugConfiguration.app
                         )}`
                     );
+                    const didStart = await this.vscodeType.debug.startDebugging(folder, managedDebugConfiguration.app);
+                    if (!didStart) {
+                        this.logger.warn(
+                            `[DEBUGGER] Blazor managed debug configuration did not start: ${BlazorDebugConfigurationProvider.stringifyDebugConfiguration(
+                                managedDebugConfiguration.app
+                            )}`
+                        );
+                        if (preloadToken || bridgeToken) {
+                            throw new Error('The managed debugger did not start before browser launch.');
+                        }
+                    }
+                } catch (error) {
+                    this.logger.error(
+                        '[DEBUGGER] Error when launching Blazor managed debug configuration: ',
+                        error as Error
+                    );
+                    if (preloadToken || bridgeToken) {
+                        throw error;
+                    }
                 }
-            } catch (error) {
-                this.logger.error(
-                    '[DEBUGGER] Error when launching Blazor managed debug configuration: ',
-                    error as Error
+            };
+
+            if (preloadToken || bridgeToken) {
+                let resolveReady!: () => void;
+                let rejectReady!: (error: Error) => void;
+                let metadataReady = !preloadToken;
+                let bridgeReady = !bridgeToken;
+                let managedSession: vscode.DebugSession | undefined;
+                let startupFailed = false;
+                let launch: Promise<void> | undefined;
+                let stoppingManaged: Promise<void> | undefined;
+                const stopManaged = async () => {
+                    if (managedSession) {
+                        stoppingManaged ??= Promise.resolve(this.vscodeType.debug.stopDebugging(managedSession));
+                    }
+                    return stoppingManaged ?? Promise.resolve();
+                };
+                const logStopFailure = (error: unknown) =>
+                    this.logger.error(
+                        '[DEBUGGER] Could not stop the managed debugger after browser startup failed.',
+                        error instanceof Error ? error : new Error(String(error))
+                    );
+                const ready = new Promise<void>((resolve, reject) => {
+                    resolveReady = resolve;
+                    rejectReady = reject;
+                });
+                const subscription = this.vscodeType.debug.onDidReceiveDebugSessionCustomEvent((event) => {
+                    if (event.session.type !== 'coreclr_wasm') {
+                        return;
+                    }
+                    if (
+                        preloadToken &&
+                        event.event === 'dotnet/localMetadataReady' &&
+                        event.body?.token === preloadToken
+                    ) {
+                        managedSession = event.session;
+                        if (event.body.success !== true || !(event.body.metadataCount > 0)) {
+                            rejectReady(new Error(event.body?.error ?? 'Local metadata preloading failed.'));
+                            return;
+                        }
+                        metadataReady = true;
+                    }
+                    if (
+                        bridgeToken &&
+                        event.event === 'dotnet/browserBridgeReady' &&
+                        event.body?.token === bridgeToken
+                    ) {
+                        managedSession = event.session;
+                        try {
+                            inspectUri = parseBrowserBridgeReady(event.body, portBrowserDebug);
+                            bridgeReady = true;
+                        } catch (error) {
+                            rejectReady(error instanceof Error ? error : new Error(String(error)));
+                            return;
+                        }
+                    }
+                    if (metadataReady && bridgeReady) {
+                        resolveReady();
+                    }
+                });
+                const started = this.vscodeType.debug.onDidStartDebugSession((session) => {
+                    if (
+                        session.type === 'coreclr_wasm' &&
+                        ((bridgeToken && session.configuration.remoteBrowserBridge?.token === bridgeToken) ||
+                            (preloadToken && session.configuration.localMetadataPreloadToken === preloadToken))
+                    ) {
+                        managedSession = session;
+                        if (startupFailed) {
+                            void stopManaged().catch(logStopFailure);
+                        }
+                    }
+                });
+                const terminated = this.vscodeType.debug.onDidTerminateDebugSession((session) => {
+                    if (session.id === managedSession?.id) {
+                        rejectReady(new Error('The managed debugger terminated before the browser was ready.'));
+                    } else if (
+                        bridgeToken &&
+                        bridgeReady &&
+                        session.configuration.port === portBrowserDebug &&
+                        session.configuration.inspectUri === inspectUri
+                    ) {
+                        startupFailed = true;
+                        rejectReady(new Error('The browser debugger terminated during managed startup.'));
+                        void stopManaged().catch(logStopFailure);
+                    }
+                });
+                const timer = setTimeout(
+                    () => rejectReady(new Error('The managed debugger was not ready before browser launch.')),
+                    30000
                 );
+                const cancelled = cancellationToken?.onCancellationRequested(() => {
+                    startupFailed = true;
+                    rejectReady(new vscode.CancellationError());
+                    void stopManaged().catch(logStopFailure);
+                });
+                try {
+                    if (cancellationToken?.isCancellationRequested) {
+                        rejectReady(new vscode.CancellationError());
+                    } else {
+                        launch = startManagedDebugging();
+                        void launch.catch(rejectReady);
+                    }
+                    await ready;
+                } catch (error) {
+                    startupFailed = true;
+                    await stopManaged();
+                    throw error;
+                } finally {
+                    clearTimeout(timer);
+                    subscription.dispose();
+                    const disposeStartupObservers = () => {
+                        started.dispose();
+                        terminated.dispose();
+                        cancelled?.dispose();
+                    };
+                    if (launch) {
+                        void launch.then(disposeStartupObservers, disposeStartupObservers);
+                    } else {
+                        disposeStartupObservers();
+                    }
+                }
+            } else if (managedDebugConfiguration.app.type === 'coreclr_wasm') {
+                void startManagedDebugging();
+            } else {
+                await startManagedDebugging();
             }
         }
 
@@ -471,29 +629,88 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
 
     private async createManagedDebugConfigurationOnBrowser(
         configuration: vscode.DebugConfiguration,
-        url: string
-    ): Promise<{ app: vscode.DebugConfiguration; inspectUri: string; portBrowserDebug: number }> {
-        const [inspectUriRet, portICorDebug, portBrowserDebug] =
-            await BlazorDebugConfigurationProvider.launchVsWebAssemblyBridge(configuration.url || url);
+        url: string,
+        projectPath: string,
+        folder?: vscode.WorkspaceFolder,
+        cancellationToken?: vscode.CancellationToken
+    ): Promise<{
+        app: vscode.DebugConfiguration;
+        inspectUri: string;
+        portBrowserDebug: number;
+        bridgeToken?: string;
+    }> {
+        const useCoreClr = await BlazorDebugConfigurationProvider.isCoreClrRuntime(projectPath);
+        const proxyFree = useCoreClr && process.platform === 'win32';
+        const bridgeToken = proxyFree ? randomUUID() : undefined;
+        let inspectUriRet: string;
+        let portICorDebug: number;
+        let portBrowserDebug: number;
+        if (proxyFree) {
+            portBrowserDebug = await findBrowserDebugPort();
+            portICorDebug = portBrowserDebug;
+            inspectUriRet = '';
+        } else {
+            [inspectUriRet, portICorDebug, portBrowserDebug] =
+                await BlazorDebugConfigurationProvider.launchVsWebAssemblyBridge(configuration.url || url, useCoreClr);
+        }
 
         const cwd = configuration.cwd || '${workspaceFolder}';
         const args = configuration.hosted ? [] : ['run'];
         const app: vscode.DebugConfiguration = {
             name: MANAGED_DEBUG_NAME,
-            type: 'monovsdbg_wasm',
+            type: useCoreClr ? 'coreclr_wasm' : 'monovsdbg_wasm',
             request: 'launch',
+            ...(process.env.VSCODE_CSHARP_WASMDBG_CONCORD ? { debugServer: 4711 } : {}),
+            ...(proxyFree ? { justMyCode: configuration.justMyCode ?? true } : {}),
             args,
             cwd,
             cascadeTerminateToConfigurations: [ONLY_JS_DEBUG_NAME, SERVER_APP_NAME, JS_DEBUG_NAME],
             ...configuration.dotNetConfig,
         };
 
-        app.monoDebuggerOptions = {
+        const debuggerOptions = {
             ip: '127.0.0.1',
             port: portICorDebug,
-            platform: 'browser',
-            isServer: true,
+            platform: useCoreClr ? 'browser;x64' : 'browser',
+            isServer: !proxyFree,
         };
+        if (useCoreClr) {
+            app.coreClrMobileDebuggerOptions = {
+                ...app.coreClrMobileDebuggerOptions,
+                ...debuggerOptions,
+            };
+            if (proxyFree && !app.program) {
+                const projects = await this.workspaceDebugInfoProvider?.getWorkspaceDebugInformation(
+                    folder?.uri ?? vscode.Uri.file(path.dirname(projectPath)),
+                    cancellationToken
+                );
+                if (cancellationToken?.isCancellationRequested) {
+                    throw new vscode.CancellationError();
+                }
+                app.program = getCoreClrBrowserProgram(projects, projectPath);
+                app.cwd = path.dirname(projectPath);
+            }
+            if (proxyFree && !app.coreClrMobileDebuggerOptions.assetsPath && typeof app.program === 'string') {
+                app.coreClrMobileDebuggerOptions.assetsPath = path.dirname(app.program);
+            }
+            if (bridgeToken) {
+                app.remoteBrowserBridge = {
+                    token: bridgeToken,
+                    browserPort: portBrowserDebug,
+                    appUrl: configuration.url || url,
+                };
+            }
+            if (typeof app.program === 'string') {
+                const symbolOptions = app.symbolOptions ?? {};
+                const searchPaths = symbolOptions.searchPaths ?? [];
+                app.symbolOptions = {
+                    ...symbolOptions,
+                    searchPaths: [...searchPaths, path.dirname(app.program)],
+                };
+            }
+        } else {
+            app.monoDebuggerOptions = debuggerOptions;
+        }
 
         this.logger.info(
             `[DEBUGGER] Blazor managed debug configuration: ${BlazorDebugConfigurationProvider.stringifyDebugConfiguration(
@@ -501,7 +718,7 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
             )}`
         );
 
-        return { app, inspectUri: inspectUriRet, portBrowserDebug };
+        return { app, inspectUri: inspectUriRet, portBrowserDebug, bridgeToken };
     }
 
     /**
@@ -509,6 +726,13 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
      * falling back to the global dotnet if the extension is unavailable.
      */
     private static async acquireDotnetPath(): Promise<string> {
+        const prototypeDotnet = process.env.VSCODE_CSHARP_WASMDBG_DOTNET;
+        if (prototypeDotnet !== undefined) {
+            if (!path.isAbsolute(prototypeDotnet) || !statSync(prototypeDotnet).isFile()) {
+                throw new Error('Configured prototype dotnet must be an existing absolute native executable path.');
+            }
+            return prototypeDotnet;
+        }
         const findPathRequest: IDotnetFindPathContext = {
             acquireContext: {
                 version: DotNetRuntimeVersion,
@@ -546,7 +770,10 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         return process.platform === 'win32' ? 'dotnet.exe' : 'dotnet';
     }
 
-    private static async launchVsWebAssemblyBridge(urlStr: string): Promise<[string, number, number]> {
+    private static async launchVsWebAssemblyBridge(
+        urlStr: string,
+        useCoreClr: boolean
+    ): Promise<[string, number, number]> {
         const dotnetPath = await BlazorDebugConfigurationProvider.acquireDotnetPath();
         const devToolsUrl = `http://localhost:0`; // Browser debugging port address
         const spawnedProxyArgs = [
@@ -555,18 +782,23 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
             `${devToolsUrl}`,
             '--UseVsDbg',
             'true',
+            '--UseCoreClr',
+            useCoreClr ? 'true' : 'false',
             '--iCorDebugPort',
             '-1',
             '--OwnerPid',
             `${process.pid}`,
         ];
         const cpOptions: cp.SpawnOptionsWithoutStdio = {
-            detached: true,
+            detached: process.env.VSCODE_CSHARP_WASMDBG_DOTNET === undefined,
             windowsHide: true,
             env: {
                 ...process.env,
                 DOTNET_ROOT: path.dirname(dotnetPath),
                 DOTNET_MULTILEVEL_LOOKUP: '0',
+                ...(process.env.VSCODE_CSHARP_WASMDBG_ARTIFACT_DIR
+                    ? { WASMDBG_ARTIFACT_DIR: process.env.VSCODE_CSHARP_WASMDBG_ARTIFACT_DIR }
+                    : {}),
             },
         };
         let chunksProcessed = 0;
@@ -724,6 +956,40 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         return false;
     }
 
+    /**
+     * Determines whether the WASM project is configured to use the CoreCLR runtime
+     * instead of the default Mono runtime. This is true when the project explicitly
+     * opts in via `<UseCoreCLR>true</UseCoreCLR>`, or opts out of Mono via
+     * `<UseMonoRuntime>false</UseMonoRuntime>` (the property currently used to switch
+     * browser-wasm projects to the CoreCLR runtime).
+     */
+    public static async isCoreClrRuntime(projectPath: string): Promise<boolean> {
+        const csprojFiles = await BlazorDebugConfigurationProvider.findCsprojFiles(projectPath);
+        for (const csproj of csprojFiles) {
+            if (BlazorDebugConfigurationProvider.usesCoreClrRuntime(csproj)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static usesCoreClrRuntime(csprojPath: string): boolean {
+        try {
+            const content = readFileSync(csprojPath, 'utf-8');
+            const useCoreClrMatch = content.match(/<UseCoreCLR>\s*(.*?)\s*<\/UseCoreCLR>/i);
+            if (useCoreClrMatch !== null) {
+                return useCoreClrMatch[1].trim().toLowerCase() === 'true';
+            }
+            const useMonoRuntimeMatch = content.match(/<UseMonoRuntime>\s*(.*?)\s*<\/UseMonoRuntime>/i);
+            if (useMonoRuntimeMatch !== null) {
+                return useMonoRuntimeMatch[1].trim().toLowerCase() === 'false';
+            }
+            return false;
+        } catch {
+            return false;
+        }
+    }
+
     private static async findCsprojFiles(projectPath: string): Promise<string[]> {
         if (projectPath === '') {
             const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -769,17 +1035,27 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         return [];
     }
     private static async useVSDbg(projectPath: string): Promise<boolean> {
+        const useCoreClr = await BlazorDebugConfigurationProvider.isCoreClrRuntime(projectPath);
+        if (useCoreClr && process.platform === 'win32') {
+            return true;
+        }
+        const existWebAssemblyWebBridge = existsSync(BlazorDebugConfigurationProvider.getWebAssemblyWebBridgePath());
+        if (!existWebAssemblyWebBridge) {
+            return false;
+        }
+
+        // CoreCLR requires the VsDbg path regardless of the Mono preference or TFM.
+        if (useCoreClr) {
+            return true;
+        }
+
         const wasmConfig = vscode.workspace.getConfiguration('csharp');
         const useVSDbg = wasmConfig.get<boolean>('wasm.debug.useVSDbg') == true;
         if (!useVSDbg) {
             return false;
         }
-        const existWebAssemblyWebBridge = existsSync(BlazorDebugConfigurationProvider.getWebAssemblyWebBridgePath());
-        let isNet9OrNewer = false;
-        if (existWebAssemblyWebBridge) {
-            isNet9OrNewer = await BlazorDebugConfigurationProvider.isNet9OrNewer(projectPath);
-        }
-        return useVSDbg && existWebAssemblyWebBridge && isNet9OrNewer;
+        const isNet9OrNewer = await BlazorDebugConfigurationProvider.isNet9OrNewer(projectPath);
+        return useVSDbg && isNet9OrNewer;
     }
 
     private static getWebAssemblyWebBridgePath() {
@@ -801,8 +1077,15 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         const useVSDbg = await BlazorDebugConfigurationProvider.useVSDbg(projectPath);
 
         if (useVSDbg) {
+            const useCoreClr = await BlazorDebugConfigurationProvider.isCoreClrRuntime(projectPath);
+            if (useCoreClr && process.platform === 'win32') {
+                throw new Error(
+                    'CoreCLR WebAssembly requires the native browser bridge launch through a blazorwasm configuration. ' +
+                        'The Mono bridge export cannot coordinate native bridge readiness.'
+                );
+            }
             const [inspectUri, portICorDebug, portBrowserDebug] =
-                await BlazorDebugConfigurationProvider.launchVsWebAssemblyBridge(urlStr);
+                await BlazorDebugConfigurationProvider.launchVsWebAssemblyBridge(urlStr, useCoreClr);
 
             return [inspectUri, portICorDebug, portBrowserDebug];
         }

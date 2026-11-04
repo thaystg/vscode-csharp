@@ -30,7 +30,8 @@ export class RoslynWorkspaceDebugInformationProvider implements IWorkspaceDebugI
     ) {}
 
     public async getWorkspaceDebugInformation(
-        workspaceFolder: vscode.Uri
+        workspaceFolder: vscode.Uri,
+        cancellationToken?: vscode.CancellationToken
     ): Promise<ProjectDebugInformation[] | undefined> {
         if (!this.server.isRunning()) {
             return;
@@ -41,18 +42,24 @@ export class RoslynWorkspaceDebugInformationProvider implements IWorkspaceDebugI
         };
 
         let response: ProjectDebugConfiguration[];
+        const cancellationSource = new vscode.CancellationTokenSource();
         try {
             response = await this.server.sendRequest(
                 WorkspaceDebugConfigurationRequest.type,
                 params,
-                new vscode.CancellationTokenSource().token
+                cancellationToken ?? cancellationSource.token
             );
         } catch (e) {
+            if (cancellationToken?.isCancellationRequested) {
+                throw new vscode.CancellationError();
+            }
             // Server errors are already logged by the language client, but its totally possible
             // that we fail because the server is restarting or a process got killed, etc.
             // Catch the error and log to the correct output (instead of going to the extension host output).
             this.outputChannel.error(`Failed to get debug configuration`, e);
             return;
+        } finally {
+            cancellationSource.dispose();
         }
 
         // LSP serializes and deserializes URIs as (URI formatted) strings not actual types.  So convert to the actual type here.

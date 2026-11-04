@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as path from 'path';
+import * as fs from 'fs';
 import * as vscode from 'vscode';
 import * as common from '../common';
 import { CoreClrDebugUtil, getTargetArchitecture, MINIMUM_SUPPORT_MACOS_DISPLAY_NAME } from './util';
@@ -35,7 +36,9 @@ export async function activate(
 
     const debugUtil = new CoreClrDebugUtil(context.extensionPath);
 
-    if (!CoreClrDebugUtil.existsSync(debugUtil.debugAdapterDir())) {
+    if (process.env.VSCODE_CSHARP_WASMDBG_CONCORD) {
+        validatePrototypeDebuggerPackage(process.env.VSCODE_CSHARP_WASMDBG_CONCORD, platformInformation);
+    } else if (!CoreClrDebugUtil.existsSync(debugUtil.debugAdapterDir())) {
         const isValidArchitecture: boolean = await checkIsValidArchitecture(platformInformation, eventStream);
         // If this is a valid architecture, we should have had a debugger, so warn if we didn't, otherwise
         // a warning was already issued, so do nothing.
@@ -114,9 +117,30 @@ export async function activate(
     disposables.add(vscode.debug.registerDebugAdapterDescriptorFactory('clr', factory));
     disposables.add(vscode.debug.registerDebugAdapterDescriptorFactory('monovsdbg', factory));
     disposables.add(vscode.debug.registerDebugAdapterDescriptorFactory('monovsdbg_wasm', factory));
+    disposables.add(vscode.debug.registerDebugAdapterDescriptorFactory('coreclr_wasm', factory));
     disposables.add(vscode.debug.registerDebugAdapterDescriptorFactory('coreclr_mobile', factory));
 
     context.subscriptions.push(disposables);
+}
+
+export function validatePrototypeDebuggerPackage(directory: string, platform: PlatformInformation): void {
+    if (!path.isAbsolute(directory)) {
+        throw new Error('Prototype Concord package must be an absolute native path.');
+    }
+    const executable = platform.isWindows() ? 'vsdbg-ui.exe' : 'vsdbg-ui';
+    const engine = platform.isWindows()
+        ? 'vsdebugeng.impl.dll'
+        : platform.isMacOS()
+          ? 'libvsdebugeng.impl.dylib'
+          : 'libvsdebugeng.impl.so';
+    for (const name of [executable, engine]) {
+        if (!fs.statSync(path.join(directory, name)).isFile()) {
+            throw new Error(`Missing prototype Concord package file: ${name}`);
+        }
+    }
+    if (!platform.isWindows()) {
+        fs.accessSync(path.join(directory, executable), fs.constants.X_OK);
+    }
 }
 
 async function checkIsValidArchitecture(
@@ -268,6 +292,14 @@ export class DebugAdapterExecutableFactory implements vscode.DebugAdapterDescrip
         _session: vscode.DebugSession,
         executable: vscode.DebugAdapterExecutable | undefined
     ): Promise<vscode.DebugAdapterDescriptor> {
+        if (_session.type === 'coreclr_wasm' && process.env.VSCODE_CSHARP_WASMDBG_CONCORD) {
+            validatePrototypeDebuggerPackage(process.env.VSCODE_CSHARP_WASMDBG_CONCORD, this.platformInfo);
+            const port = _session.configuration.debugServer;
+            if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+                throw new Error('Prototype Concord package requires an explicit loopback debugServer port.');
+            }
+            return new vscode.DebugAdapterServer(port, '127.0.0.1');
+        }
         const util = new CoreClrDebugUtil(common.getExtensionPath());
 
         // Check for .debugger folder. Handle if it does not exist.
