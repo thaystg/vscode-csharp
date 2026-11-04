@@ -3,15 +3,18 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { beforeEach, describe, expect, jest, test } from '@jest/globals';
+import { afterEach, beforeEach, describe, expect, jest, test } from '@jest/globals';
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as cp from 'child_process';
+import { URI } from 'vscode-uri';
 import { BlazorDebugConfigurationProvider } from '../../../src/razor/src/blazorDebug/blazorDebugConfigurationProvider';
 import { BaseVsDbgConfigurationProvider } from '../../../src/shared/configurationProvider';
 import { PlatformInformation } from '../../../src/shared/platform';
 import { setExtensionPath } from '../../../src/common';
 import { getNullChannel } from '../../fakes';
+import * as browserBridge from '../../../src/razor/src/blazorDebug/browserBridge';
+import type { ProjectDebugInformation } from '../../../src/shared/IWorkspaceDebugInformationProvider';
 
 jest.mock('vscode', () => {
     const { getFakeVsCode, getNullChannel, getWorkspaceConfiguration } =
@@ -28,8 +31,15 @@ jest.mock('vscode', () => {
         },
         extensions: { ...fake.extensions, getExtension: jest.fn() },
         commands: { executeCommand: jest.fn(async () => ({ dotnetPath: '/dotnet/dotnet' })) },
+        CancellationError: class extends Error {
+            constructor() {
+                super('Canceled');
+            }
+        },
         debug: {
             startDebugging: jest.fn(async () => true),
+            stopDebugging: jest.fn(async () => undefined),
+            onDidReceiveDebugSessionCustomEvent: jest.fn(() => ({ dispose: jest.fn() })),
             onDidStartDebugSession: jest.fn(() => ({ dispose: jest.fn() })),
             onDidTerminateDebugSession: jest.fn(() => ({ dispose: jest.fn() })),
         },
@@ -59,10 +69,11 @@ jest.mock('child_process', () => {
 });
 
 describe('Browser debug configuration', () => {
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
     const workspacePath = path.resolve('testWorkspace');
     const program = path.join(workspacePath, 'bin', 'App.dll');
     const assetsPath = path.join(workspacePath, 'wwwroot', '_framework');
-    const folder: vscode.WorkspaceFolder = { name: 'App', uri: vscode.Uri.file(workspacePath), index: 0 };
+    const folder: vscode.WorkspaceFolder = { name: 'App', uri: URI.file(workspacePath), index: 0 };
     const logger: vscode.LogOutputChannel = {
         ...getNullChannel(),
         replace: jest.fn(),
@@ -79,6 +90,7 @@ describe('Browser debug configuration', () => {
 
     beforeEach(() => {
         jest.clearAllMocks();
+        Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
         setExtensionPath(workspacePath);
         jest.spyOn(BlazorDebugConfigurationProvider, 'isCoreClrRuntime').mockResolvedValue(true);
         workspaceProvider = new BaseVsDbgConfigurationProvider(new PlatformInformation('darwin', 'arm64'), logger);
@@ -87,6 +99,10 @@ describe('Browser debug configuration', () => {
             path.dirname(program),
             program,
         ]);
+    });
+    afterEach(() => {
+        jest.restoreAllMocks();
+        Object.defineProperty(process, 'platform', platformDescriptor);
     });
 
     async function createBlazorManagedConfiguration(dotNetConfig: object = {}): Promise<vscode.DebugConfiguration> {
@@ -317,5 +333,197 @@ describe('Browser debug configuration', () => {
         expect(resolved?.coreClrMobileDebuggerOptions).toBeUndefined();
         expect(resolved?.monoDebuggerOptions).toEqual({ platform: 'browser', assetsPath: path.dirname(program) });
         expect(resolved?.program).toBe(program);
+    });
+
+    describe('Windows CoreCLR hosted attach', () => {
+        const clientProject = path.join(workspacePath, 'client', 'Client.csproj');
+        const clientProgram = path.join(workspacePath, 'client', 'custom-output', 'Client.dll');
+        const serverDirectory = path.join(workspacePath, 'server');
+        const relay = 'ws://127.0.0.1:45678/ws-proxy?browser={browserInspectUri}';
+        let nativeFailure: string | undefined;
+        let onEvent: Parameters<typeof vscode.debug.onDidReceiveDebugSessionCustomEvent>[0] | undefined;
+        let onTerminate: Parameters<typeof vscode.debug.onDidTerminateDebugSession>[0] | undefined;
+        let keepManagedPending: boolean;
+        let finishManaged: (() => void) | undefined;
+        let managedSession: vscode.DebugSession;
+        const client: ProjectDebugInformation = {
+            projectPath: clientProject,
+            outputPath: clientProgram,
+            projectName: 'Client',
+            solutionPath: null,
+            targetsDotnetCore: true,
+            isExe: true,
+            isWebProject: false,
+            isWebAssemblyProject: true,
+            isBlazorWebAssemblyHosted: false,
+            isBlazorWebAssemblyStandalone: true,
+        };
+        const projects = {
+            getWorkspaceDebugInformation: jest.fn(async () => [
+                { ...client, projectPath: path.join(serverDirectory, 'Server.csproj'), outputPath: program },
+                client,
+            ]),
+        };
+        const configuration: vscode.DebugConfiguration = {
+            name: 'Hosted client',
+            type: 'blazorwasm',
+            request: 'attach',
+            projectPath: clientProject,
+            cwd: serverDirectory,
+            hosted: true,
+            browser: 'edge',
+            url: 'http://localhost:5000',
+            inspectUri:
+                '{wsProtocol}://{url.hostname}:{url.port}/_framework/debug/ws-proxy?browser={browserInspectUri}',
+        };
+
+        beforeEach(() => {
+            Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+            jest.spyOn(browserBridge, 'findBrowserDebugPort').mockResolvedValue(6002);
+            nativeFailure = undefined;
+            onEvent = undefined;
+            onTerminate = undefined;
+            keepManagedPending = false;
+            finishManaged = undefined;
+            jest.mocked(vscode.debug.onDidTerminateDebugSession).mockImplementation((listener) => {
+                onTerminate = listener;
+                return { dispose: jest.fn() };
+            });
+            jest.mocked(vscode.debug.onDidReceiveDebugSessionCustomEvent).mockImplementation((listener) => {
+                onEvent = listener;
+                return { dispose: jest.fn() };
+            });
+            jest.mocked(vscode.debug.startDebugging).mockImplementation(async (_, config) => {
+                if (typeof config !== 'object') {
+                    throw new Error('Expected managed configuration.');
+                }
+                managedSession = {
+                    id: 'owned-native-session',
+                    name: config.name,
+                    type: config.type,
+                    configuration: config,
+                    workspaceFolder: folder,
+                    parentSession: undefined,
+                    customRequest: async () => undefined,
+                    getDebugProtocolBreakpoint: async () => undefined,
+                };
+                onEvent?.({
+                    session: managedSession,
+                    event: 'dotnet/browserBridgeReady',
+                    body: { token: 'unrelated', success: false, error: 'Must be ignored.' },
+                });
+                onEvent?.({
+                    session: managedSession,
+                    event: 'dotnet/browserBridgeReady',
+                    body: {
+                        token: config.remoteBrowserBridge.token,
+                        success: nativeFailure === undefined,
+                        error: nativeFailure,
+                        browserPort: 6002,
+                        inspectUri: relay,
+                    },
+                });
+                if (keepManagedPending) {
+                    await new Promise<void>((resolve) => {
+                        finishManaged = resolve;
+                    });
+                }
+                return true;
+            });
+        });
+
+        test('resolves exact client output without dotNetConfig and replaces the legacy relay', async () => {
+            const provider = new BlazorDebugConfigurationProvider(logger, vscode, projects);
+            const browser = await provider.resolveDebugConfiguration(folder, configuration);
+            const managed = managedSession.configuration;
+            expect(managed.program).toBe(clientProgram);
+            expect(managed.cwd).toBe(path.dirname(clientProject));
+            expect(managed.args).toEqual([]);
+            expect(managed.coreClrMobileDebuggerOptions).toMatchObject({
+                assetsPath: path.dirname(clientProgram),
+                ip: '127.0.0.1',
+                port: 6002,
+                isServer: false,
+            });
+            expect(browser).toMatchObject({ type: 'msedge', port: 6002, inspectUri: relay });
+            expect(cp.spawn).not.toHaveBeenCalled();
+        });
+
+        test('preserves explicit client program and avoids a workspace query', async () => {
+            const provider = new BlazorDebugConfigurationProvider(logger, vscode, projects);
+            await provider.resolveDebugConfiguration(folder, {
+                ...configuration,
+                dotNetConfig: { program: clientProgram },
+            });
+            expect(managedSession.configuration.program).toBe(clientProgram);
+            expect(projects.getWorkspaceDebugInformation).not.toHaveBeenCalled();
+        });
+
+        test('native failure stops only the token-correlated initializing managed session', async () => {
+            nativeFailure = 'Native startup failed.';
+            const provider = new BlazorDebugConfigurationProvider(logger, vscode, projects);
+            await expect(provider.resolveDebugConfiguration(folder, configuration)).rejects.toThrow(nativeFailure);
+            expect(vscode.debug.stopDebugging).toHaveBeenCalledTimes(1);
+            expect(vscode.debug.stopDebugging).toHaveBeenCalledWith(managedSession);
+            expect(cp.spawn).not.toHaveBeenCalled();
+        });
+
+        test('cancelled project resolution does not start a managed session or browser', async () => {
+            const token: vscode.CancellationToken = {
+                isCancellationRequested: true,
+                onCancellationRequested: () => ({ dispose: jest.fn() }),
+            };
+            const provider = new BlazorDebugConfigurationProvider(logger, vscode, projects);
+            await expect(provider.resolveDebugConfiguration(folder, configuration, token)).rejects.toThrow('Canceled');
+            expect(vscode.debug.startDebugging).not.toHaveBeenCalled();
+            expect(cp.spawn).not.toHaveBeenCalled();
+        });
+
+        test('cancellation after native readiness still stops the initializing managed session', async () => {
+            keepManagedPending = true;
+            let cancel: (() => void) | undefined;
+            const token: vscode.CancellationToken = {
+                isCancellationRequested: false,
+                onCancellationRequested: (listener) => {
+                    cancel = () => listener(undefined);
+                    return { dispose: jest.fn() };
+                },
+            };
+            const provider = new BlazorDebugConfigurationProvider(logger, vscode, projects);
+            try {
+                await provider.resolveDebugConfiguration(folder, configuration, token);
+                cancel?.();
+                expect(vscode.debug.stopDebugging).toHaveBeenCalledTimes(1);
+                expect(vscode.debug.stopDebugging).toHaveBeenCalledWith(managedSession);
+            } finally {
+                finishManaged?.();
+            }
+        });
+
+        test.each([true, false])(
+            'only its own failed browser startup stops managed launch: owned=%s',
+            async (owned) => {
+                keepManagedPending = true;
+                const provider = new BlazorDebugConfigurationProvider(logger, vscode, projects);
+                try {
+                    const browser = await provider.resolveDebugConfiguration(folder, configuration);
+                    if (!browser) {
+                        throw new Error('Expected native browser configuration.');
+                    }
+                    onTerminate?.({
+                        ...managedSession,
+                        id: 'browser-session',
+                        type: 'msedge',
+                        configuration: { ...browser, inspectUri: owned ? relay : 'ws://127.0.0.1:11111/unrelated' },
+                    });
+                    expect(vscode.debug.stopDebugging).toHaveBeenCalledTimes(owned ? 1 : 0);
+                    if (owned) {
+                        expect(vscode.debug.stopDebugging).toHaveBeenCalledWith(managedSession);
+                    }
+                } finally {
+                    finishManaged?.();
+                }
+            }
+        );
     });
 });
