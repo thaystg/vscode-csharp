@@ -640,7 +640,7 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         bridgeToken?: string;
     }> {
         const useCoreClr = await BlazorDebugConfigurationProvider.isCoreClrRuntime(projectPath);
-        const proxyFree = useCoreClr && process.platform === 'win32';
+        const proxyFree = useCoreClr;
         const bridgeToken = proxyFree ? randomUUID() : undefined;
         let inspectUriRet: string;
         let portICorDebug: number;
@@ -1036,17 +1036,12 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
     }
     private static async useVSDbg(projectPath: string): Promise<boolean> {
         const useCoreClr = await BlazorDebugConfigurationProvider.isCoreClrRuntime(projectPath);
-        if (useCoreClr && process.platform === 'win32') {
+        if (useCoreClr) {
             return true;
         }
         const existWebAssemblyWebBridge = existsSync(BlazorDebugConfigurationProvider.getWebAssemblyWebBridgePath());
         if (!existWebAssemblyWebBridge) {
             return false;
-        }
-
-        // CoreCLR requires the VsDbg path regardless of the Mono preference or TFM.
-        if (useCoreClr) {
-            return true;
         }
 
         const wasmConfig = vscode.workspace.getConfiguration('csharp');
@@ -1078,7 +1073,7 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
 
         if (useVSDbg) {
             const useCoreClr = await BlazorDebugConfigurationProvider.isCoreClrRuntime(projectPath);
-            if (useCoreClr && process.platform === 'win32') {
+            if (useCoreClr) {
                 throw new Error(
                     'CoreCLR WebAssembly requires the native browser bridge launch through a blazorwasm configuration. ' +
                         'The Mono bridge export cannot coordinate native bridge readiness.'

@@ -93,6 +93,37 @@ describe('Browser debug configuration', () => {
         Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
         setExtensionPath(workspacePath);
         jest.spyOn(BlazorDebugConfigurationProvider, 'isCoreClrRuntime').mockResolvedValue(true);
+        jest.spyOn(browserBridge, 'findBrowserDebugPort').mockResolvedValue(6002);
+        let onEvent: Parameters<typeof vscode.debug.onDidReceiveDebugSessionCustomEvent>[0] | undefined;
+        jest.mocked(vscode.debug.onDidReceiveDebugSessionCustomEvent).mockImplementation((listener) => {
+            onEvent = listener;
+            return { dispose: jest.fn() };
+        });
+        jest.mocked(vscode.debug.startDebugging).mockImplementation(async (_, configuration) => {
+            if (typeof configuration !== 'object') {
+                throw new Error('Expected native managed configuration.');
+            }
+            onEvent?.({
+                session: {
+                    id: 'native-session',
+                    name: configuration.name,
+                    type: configuration.type,
+                    configuration,
+                    workspaceFolder: folder,
+                    parentSession: undefined,
+                    customRequest: async () => undefined,
+                    getDebugProtocolBreakpoint: async () => undefined,
+                },
+                event: 'dotnet/browserBridgeReady',
+                body: {
+                    token: configuration.remoteBrowserBridge.token,
+                    success: true,
+                    browserPort: 6002,
+                    inspectUri: 'ws://127.0.0.1:45678/ws-proxy?browser={browserInspectUri}',
+                },
+            });
+            return true;
+        });
         workspaceProvider = new BaseVsDbgConfigurationProvider(new PlatformInformation('darwin', 'arm64'), logger);
         jest.spyOn(workspaceProvider, 'isDotnetWorkspaceConfigurationProvider').mockReturnValue(true);
         jest.spyOn(workspaceProvider, 'getNet9WasmAssetsPathAndProgram').mockResolvedValue([
@@ -106,7 +137,22 @@ describe('Browser debug configuration', () => {
     });
 
     async function createBlazorManagedConfiguration(dotNetConfig: object = {}): Promise<vscode.DebugConfiguration> {
-        const provider = new BlazorDebugConfigurationProvider(logger, vscode);
+        const provider = new BlazorDebugConfigurationProvider(logger, vscode, {
+            getWorkspaceDebugInformation: async () => [
+                {
+                    projectPath: path.join(workspacePath, 'App.csproj'),
+                    outputPath: program,
+                    projectName: 'App',
+                    solutionPath: null,
+                    targetsDotnetCore: true,
+                    isExe: true,
+                    isWebProject: false,
+                    isWebAssemblyProject: true,
+                    isBlazorWebAssemblyHosted: false,
+                    isBlazorWebAssemblyStandalone: true,
+                },
+            ],
+        });
         await provider.resolveDebugConfiguration(undefined, {
             name: 'Browser App',
             type: 'blazorwasm',
@@ -140,8 +186,7 @@ describe('Browser debug configuration', () => {
         expect(browser?.type).toBe('msedge');
         expect(browser?.trace).toBe(true);
         expect(browser?.runtimeExecutable).toBe('/explicit/edge');
-        expect(jest.mocked(cp.spawn).mock.calls[0][1]).not.toContain('--DevToolsProxyLogging');
-        expect(jest.mocked(cp.spawn).mock.calls[0][2]?.env?.WASMDBG_LOGGING).toBeUndefined();
+        expect(cp.spawn).not.toHaveBeenCalled();
     });
     test('explicit prototype host uses the configured dotnet without acquisition and scopes logs to proxy', async () => {
         const oldDotnet = process.env.VSCODE_CSHARP_WASMDBG_DOTNET;
@@ -149,7 +194,7 @@ describe('Browser debug configuration', () => {
         try {
             process.env.VSCODE_CSHARP_WASMDBG_DOTNET = __filename;
             process.env.VSCODE_CSHARP_WASMDBG_ARTIFACT_DIR = path.join(workspacePath, 'run', 'proxy-logs');
-            await createBlazorManagedConfiguration();
+            await BlazorDebugConfigurationProvider['launchVsWebAssemblyBridge']('http://localhost:5000', true);
             const [command, , options] = jest.mocked(cp.spawn).mock.calls[0];
             expect(command).toBe(__filename);
             expect(options?.env?.WASMDBG_ARTIFACT_DIR).toBe(process.env.VSCODE_CSHARP_WASMDBG_ARTIFACT_DIR);
@@ -177,7 +222,9 @@ describe('Browser debug configuration', () => {
         const old = process.env.VSCODE_CSHARP_WASMDBG_DOTNET;
         try {
             process.env.VSCODE_CSHARP_WASMDBG_DOTNET = 'relative-host';
-            await expect(createBlazorManagedConfiguration()).rejects.toThrow('absolute native');
+            await expect(
+                BlazorDebugConfigurationProvider['launchVsWebAssemblyBridge']('http://localhost:5000', true)
+            ).rejects.toThrow('absolute native');
             expect(jest.mocked(cp.spawn)).not.toHaveBeenCalled();
         } finally {
             if (old === undefined) {
@@ -211,15 +258,15 @@ describe('Browser debug configuration', () => {
         expect(resolved?.coreClrMobileDebuggerOptions).toEqual({
             ...callerOptions,
             ip: '127.0.0.1',
-            port: 6001,
+            port: 6002,
             platform: 'browser;x64',
-            isServer: true,
+            isServer: false,
         });
         expect(workspaceProvider.getNet9WasmAssetsPathAndProgram).not.toHaveBeenCalled();
         expect(callerOptions.platform).toBe('android');
     });
 
-    test('Blazor infers missing assets and program for the generated browser;x64 child', async () => {
+    test('Blazor resolves native client assets and program without legacy host inference', async () => {
         const configuration = await createBlazorManagedConfiguration();
         const resolved = await workspaceProvider.resolveDebugConfigurationWithSubstitutedVariables(
             folder,
@@ -228,13 +275,13 @@ describe('Browser debug configuration', () => {
 
         expect(resolved?.coreClrMobileDebuggerOptions).toEqual({
             ip: '127.0.0.1',
-            port: 6001,
+            port: 6002,
             platform: 'browser;x64',
-            isServer: true,
+            isServer: false,
             assetsPath: path.dirname(program),
         });
         expect(resolved?.program).toBe(program);
-        expect(workspaceProvider.getNet9WasmAssetsPathAndProgram).toHaveBeenCalledWith(folder);
+        expect(workspaceProvider.getNet9WasmAssetsPathAndProgram).not.toHaveBeenCalled();
     });
 
     test.each(['browser', 'browser;x64', 'x64;browser'])(
@@ -358,7 +405,7 @@ describe('Browser debug configuration', () => {
         expect(resolved?.program).toBe(program);
     });
 
-    describe('Windows CoreCLR hosted attach', () => {
+    describe.each(['win32', 'linux', 'darwin'])('%s CoreCLR hosted attach', (platform) => {
         const clientProject = path.join(workspacePath, 'client', 'Client.csproj');
         const clientProgram = path.join(workspacePath, 'client', 'custom-output', 'Client.dll');
         const serverDirectory = path.join(workspacePath, 'server');
@@ -401,8 +448,7 @@ describe('Browser debug configuration', () => {
         };
 
         beforeEach(() => {
-            Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-            jest.spyOn(browserBridge, 'findBrowserDebugPort').mockResolvedValue(6002);
+            Object.defineProperty(process, 'platform', { value: platform, configurable: true });
             nativeFailure = undefined;
             onEvent = undefined;
             onTerminate = undefined;
@@ -469,7 +515,15 @@ describe('Browser debug configuration', () => {
                 port: 6002,
                 isServer: false,
             });
+
             expect(browser).toMatchObject({ type: 'msedge', port: 6002, inspectUri: relay });
+            expect(cp.spawn).not.toHaveBeenCalled();
+        });
+
+        test('legacy Mono export cannot bypass native CoreCLR readiness', async () => {
+            await expect(
+                BlazorDebugConfigurationProvider.tryToUseVSDbgForMono(configuration.url, clientProject)
+            ).rejects.toThrow('requires the native browser bridge launch');
             expect(cp.spawn).not.toHaveBeenCalled();
         });
 
