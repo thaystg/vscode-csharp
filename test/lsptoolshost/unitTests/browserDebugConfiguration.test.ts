@@ -30,8 +30,10 @@ jest.mock('vscode', () => {
         commands: { executeCommand: jest.fn(async () => ({ dotnetPath: '/dotnet/dotnet' })) },
         debug: {
             startDebugging: jest.fn(async () => true),
+            stopDebugging: jest.fn(async () => undefined),
             onDidStartDebugSession: jest.fn(() => ({ dispose: jest.fn() })),
             onDidTerminateDebugSession: jest.fn(() => ({ dispose: jest.fn() })),
+            onDidReceiveDebugSessionCustomEvent: jest.fn(() => ({ dispose: jest.fn() })),
         },
     };
 });
@@ -107,6 +109,220 @@ describe('Browser debug configuration', () => {
         }
         return managed;
     }
+
+    function publishNativeBridgeEvent(event: string, body: object, configuration: vscode.DebugConfiguration): void {
+        const session = {
+            id: 'native-session',
+            name: configuration.name,
+            type: configuration.type,
+            configuration,
+        } as vscode.DebugSession;
+        for (const [listener] of jest.mocked(vscode.debug.onDidStartDebugSession).mock.calls) {
+            listener(session);
+        }
+        for (const [listener] of jest.mocked(vscode.debug.onDidReceiveDebugSessionCustomEvent).mock.calls) {
+            listener({ session, event, body });
+        }
+    }
+
+    test('native bridge starts Concord before js-debug and never launches BrowserDebugHost', async () => {
+        let managedConfiguration: vscode.DebugConfiguration | undefined;
+        jest.mocked(vscode.debug.startDebugging).mockImplementation(async (_folder, configuration) => {
+            if (typeof configuration !== 'string' && configuration.remoteBrowserBridge) {
+                managedConfiguration = configuration;
+                queueMicrotask(() => {
+                    publishNativeBridgeEvent(
+                        'dotnet/browserBridgeReady',
+                        {
+                            token: configuration.remoteBrowserBridge.token,
+                            success: true,
+                            browserPort: 6200,
+                            inspectUri: 'ws://127.0.0.1:6300/{browserInspectUriPath}',
+                        },
+                        configuration
+                    );
+                });
+            }
+            return true;
+        });
+
+        const provider = new BlazorDebugConfigurationProvider(logger, vscode);
+        const browser = await provider.resolveDebugConfiguration(undefined, {
+            name: 'Native browser app',
+            type: 'blazorwasm',
+            request: 'attach',
+            projectPath: path.join(workspacePath, 'App.csproj'),
+            cwd: workspacePath,
+            browser: 'chrome',
+            url: 'http://localhost:5000',
+            nativeBrowserBridge: { enabled: true, browserPort: 6200 },
+            dotNetConfig: { program, coreClrMobileDebuggerOptions: { assetsPath } },
+        });
+
+        expect(cp.spawn).not.toHaveBeenCalled();
+        expect(managedConfiguration?.remoteBrowserBridge).toEqual({
+            token: expect.any(String),
+            browserPort: 6200,
+            appUrl: 'http://localhost:5000',
+        });
+        expect(managedConfiguration?.coreClrMobileDebuggerOptions).toEqual({
+            assetsPath,
+            ip: '127.0.0.1',
+            port: 6200,
+            platform: 'browser;x64',
+            isServer: false,
+        });
+        expect(browser).toMatchObject({
+            type: 'chrome',
+            port: 6200,
+            inspectUri: 'ws://127.0.0.1:6300/{browserInspectUriPath}',
+        });
+        expect(jest.mocked(vscode.debug.startDebugging).mock.calls[0][1]).toBe(managedConfiguration);
+    });
+
+    test('native bridge waits for required local metadata before launching js-debug', async () => {
+        let managedConfiguration: vscode.DebugConfiguration | undefined;
+        let publishMetadata: (() => void) | undefined;
+        jest.mocked(vscode.debug.startDebugging).mockImplementation(async (_folder, configuration) => {
+            if (typeof configuration !== 'string' && configuration.remoteBrowserBridge) {
+                managedConfiguration = configuration;
+                queueMicrotask(() => {
+                    publishNativeBridgeEvent(
+                        'dotnet/browserBridgeReady',
+                        {
+                            token: configuration.remoteBrowserBridge.token,
+                            success: true,
+                            browserPort: 6201,
+                            inspectUri: 'ws://127.0.0.1:6301/{browserInspectUriPath}',
+                        },
+                        configuration
+                    );
+                    publishMetadata = () =>
+                        publishNativeBridgeEvent(
+                            'dotnet/localMetadataReady',
+                            {
+                                token: configuration.localMetadataPreloadToken,
+                                success: true,
+                                metadataCount: 12,
+                            },
+                            configuration
+                        );
+                });
+            }
+            return true;
+        });
+
+        const provider = new BlazorDebugConfigurationProvider(logger, vscode);
+        let settled = false;
+        const result = provider
+            .resolveDebugConfiguration(undefined, {
+                name: 'Native metadata app',
+                type: 'blazorwasm',
+                request: 'attach',
+                projectPath: path.join(workspacePath, 'App.csproj'),
+                url: 'http://localhost:5000',
+                nativeBrowserBridge: {
+                    enabled: true,
+                    browserPort: 6201,
+                    preloadLocalMetadata: true,
+                },
+                dotNetConfig: { program, coreClrMobileDebuggerOptions: { assetsPath } },
+            })
+            .then((value) => {
+                settled = true;
+                return value;
+            });
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(settled).toBe(false);
+        expect(managedConfiguration?.localMetadataPreloadToken).toEqual(expect.any(String));
+
+        publishMetadata?.();
+        await expect(result).resolves.toMatchObject({ port: 6201 });
+    });
+
+    test('native bridge failure is propagated without managed fallback', async () => {
+        jest.mocked(vscode.debug.startDebugging).mockImplementation(async (_folder, configuration) => {
+            if (typeof configuration !== 'string' && configuration.remoteBrowserBridge) {
+                queueMicrotask(() => {
+                    publishNativeBridgeEvent(
+                        'dotnet/browserBridgeReady',
+                        {
+                            token: configuration.remoteBrowserBridge.token,
+                            success: false,
+                            error: 'native preparation failed',
+                        },
+                        configuration
+                    );
+                });
+            }
+            return true;
+        });
+
+        const provider = new BlazorDebugConfigurationProvider(logger, vscode);
+        await expect(
+            provider.resolveDebugConfiguration(undefined, {
+                name: 'Native failure',
+                type: 'blazorwasm',
+                request: 'attach',
+                projectPath: path.join(workspacePath, 'App.csproj'),
+                nativeBrowserBridge: { enabled: true, browserPort: 6202 },
+                dotNetConfig: { program, coreClrMobileDebuggerOptions: { assetsPath } },
+            })
+        ).rejects.toThrow('native preparation failed');
+        expect(cp.spawn).not.toHaveBeenCalled();
+    });
+
+    test('native bridge cancellation rejects and does not launch BrowserDebugHost', async () => {
+        let cancel: (() => void) | undefined;
+        const cancellationToken = {
+            isCancellationRequested: false,
+            onCancellationRequested: (
+                listener: () => void,
+                _thisArgs?: unknown,
+                _disposables?: vscode.Disposable[]
+            ) => {
+                cancel = listener;
+                return { dispose: jest.fn() };
+            },
+        } as unknown as vscode.CancellationToken;
+        jest.mocked(vscode.debug.startDebugging).mockImplementation(async () => {
+            queueMicrotask(() => cancel?.());
+            return true;
+        });
+
+        const provider = new BlazorDebugConfigurationProvider(logger, vscode);
+        await expect(
+            provider.resolveDebugConfiguration(
+                undefined,
+                {
+                    name: 'Native cancellation',
+                    type: 'blazorwasm',
+                    request: 'attach',
+                    projectPath: path.join(workspacePath, 'App.csproj'),
+                    nativeBrowserBridge: { enabled: true, browserPort: 6203 },
+                    dotNetConfig: { program, coreClrMobileDebuggerOptions: { assetsPath } },
+                },
+                cancellationToken
+            )
+        ).rejects.toThrow('was canceled');
+        expect(cp.spawn).not.toHaveBeenCalled();
+    });
+
+    test('native bridge opt-in is rejected for Mono without falling back', async () => {
+        jest.mocked(BlazorDebugConfigurationProvider.isCoreClrRuntime).mockResolvedValue(false);
+        const provider = new BlazorDebugConfigurationProvider(logger, vscode);
+        await expect(
+            provider.resolveDebugConfiguration(undefined, {
+                name: 'Mono native bridge',
+                type: 'blazorwasm',
+                request: 'attach',
+                projectPath: path.join(workspacePath, 'App.csproj'),
+                nativeBrowserBridge: { enabled: true, browserPort: 6204 },
+            })
+        ).rejects.toThrow('supported only for CoreCLR');
+        expect(cp.spawn).not.toHaveBeenCalled();
+    });
+
     test('Havit baseline trace reaches the browser configuration without enabling proxy protocol trace', async () => {
         const provider = new BlazorDebugConfigurationProvider(logger, vscode);
         const browser = await provider.resolveDebugConfiguration(undefined, {

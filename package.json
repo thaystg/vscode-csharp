@@ -4699,6 +4699,40 @@
                 "description": "Controls whether the browser and WebAssembly debug sessions are launched. If false, only the Blazor WebAssembly app process is launched.",
                 "default": true
               },
+              "nativeBrowserBridge": {
+                "type": "object",
+                "description": "Explicitly enables the native CoreCLR browser bridge instead of BrowserDebugHost. Native preparation failures are reported without falling back to the managed bridge.",
+                "default": {
+                  "enabled": false
+                },
+                "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "browserPort": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 65535,
+                    "description": "Optional fixed browser DevTools port. When omitted, an available loopback port is selected."
+                  },
+                  "targetId": {
+                    "type": "string",
+                    "description": "Optional browser target identifier passed to the native bridge."
+                  },
+                  "preloadLocalMetadata": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Require native local metadata preload before browser launch."
+                  },
+                  "readinessTimeout": {
+                    "type": "number",
+                    "minimum": 1,
+                    "default": 30000,
+                    "description": "Maximum time in milliseconds to wait for native bridge readiness."
+                  }
+                }
+              },
               "program": {
                 "type": "string",
                 "default": "${workspaceFolder}/Server/bin/Debug/<target-framework>/<target-dll>",
@@ -4843,6 +4877,40 @@
                 "type": "number",
                 "default": 30000,
                 "description": "Retry for this number of milliseconds to connect to browser."
+              },
+              "nativeBrowserBridge": {
+                "type": "object",
+                "description": "Explicitly enables the native CoreCLR browser bridge instead of BrowserDebugHost. Native preparation failures are reported without falling back to the managed bridge.",
+                "default": {
+                  "enabled": false
+                },
+                "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "browserPort": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 65535,
+                    "description": "Optional fixed browser DevTools port. When omitted, an available loopback port is selected."
+                  },
+                  "targetId": {
+                    "type": "string",
+                    "description": "Optional browser target identifier passed to the native bridge."
+                  },
+                  "preloadLocalMetadata": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Require native local metadata preload before browser launch."
+                  },
+                  "readinessTimeout": {
+                    "type": "number",
+                    "minimum": 1,
+                    "default": 30000,
+                    "description": "Maximum time in milliseconds to wait for native bridge readiness."
+                  }
+                }
               },
               "browserConfig": {
                 "description": "Options passed to the underlying browser debugger.",

@@ -6,6 +6,8 @@
 import { promises, readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
+import { randomBytes } from 'crypto';
+import * as net from 'net';
 import * as vscode from 'vscode';
 import { ChromeBrowserFinder, EdgeBrowserFinder } from '@vscode/js-debug-browsers';
 import { ONLY_JS_DEBUG_NAME, MANAGED_DEBUG_NAME, JS_DEBUG_NAME, SERVER_APP_NAME } from './constants';
@@ -45,6 +47,29 @@ interface ProjectDebugTargetFrameworkInfo {
 interface FrameworkInfo {
     framework: string;
     displayName: string;
+}
+
+interface NativeBrowserBridgeOptions {
+    enabled?: boolean;
+    browserPort?: number;
+    targetId?: string;
+    preloadLocalMetadata?: boolean;
+    readinessTimeout?: number;
+}
+
+interface NativeBrowserBridgeReadyBody {
+    token?: string;
+    success?: boolean;
+    error?: string;
+    browserPort?: number;
+    inspectUri?: string;
+}
+
+interface ManagedBrowserDebugConfiguration {
+    app: vscode.DebugConfiguration;
+    inspectUri: string;
+    portBrowserDebug: number;
+    nativeBridgeReadiness?: Promise<{ inspectUri: string; browserPort: number }>;
 }
 
 const targetFrameworkServiceDescriptor: ServiceRpcDescriptor = Object.freeze(
@@ -120,7 +145,8 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
 
     public async resolveDebugConfiguration(
         folder: vscode.WorkspaceFolder | undefined,
-        configuration: vscode.DebugConfiguration
+        configuration: vscode.DebugConfiguration,
+        cancellationToken?: vscode.CancellationToken
     ): Promise<vscode.DebugConfiguration | undefined> {
         const debugFolder = BlazorDebugConfigurationProvider.resolveDebugFolder(folder, configuration);
         this.logger.info(
@@ -182,7 +208,8 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
                 debugFolder,
                 configuration,
                 inspectUri,
-                url
+                url,
+                cancellationToken
             );
             debugConfigurations.push(...browserConfigurations);
         }
@@ -323,47 +350,54 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         folder: vscode.WorkspaceFolder | undefined,
         configuration: vscode.DebugConfiguration,
         inspectUri: string,
-        url: string
+        url: string,
+        cancellationToken?: vscode.CancellationToken
     ): Promise<vscode.DebugConfiguration[]> {
         const debugConfigurations: vscode.DebugConfiguration[] = [];
         const projectPath = BlazorDebugConfigurationProvider.resolveProjectPath(folder, configuration);
-        const useVSDbg = await BlazorDebugConfigurationProvider.useVSDbg(projectPath);
+        const nativeBridge = configuration.nativeBrowserBridge as NativeBrowserBridgeOptions | undefined;
+        const useVSDbg =
+            nativeBridge?.enabled === true || (await BlazorDebugConfigurationProvider.useVSDbg(projectPath));
         let portBrowserDebug = -1;
         if (useVSDbg) {
             const managedDebugConfiguration = await this.createManagedDebugConfigurationOnBrowser(
                 configuration,
                 url,
-                projectPath
+                projectPath,
+                cancellationToken
             );
-            inspectUri = managedDebugConfiguration.inspectUri;
             portBrowserDebug = managedDebugConfiguration.portBrowserDebug;
             const startManagedDebugging = async () => {
-                try {
-                    this.logger.info(
-                        `[DEBUGGER] Starting Blazor managed debug configuration: ${BlazorDebugConfigurationProvider.stringifyDebugConfiguration(
-                            managedDebugConfiguration.app
-                        )}`
-                    );
-                    const didStart = await this.vscodeType.debug.startDebugging(folder, managedDebugConfiguration.app);
-                    if (!didStart) {
-                        this.logger.warn(
-                            `[DEBUGGER] Blazor managed debug configuration did not start: ${BlazorDebugConfigurationProvider.stringifyDebugConfiguration(
-                                managedDebugConfiguration.app
-                            )}`
-                        );
-                    }
-                } catch (error) {
+                this.logger.info(
+                    `[DEBUGGER] Starting Blazor managed debug configuration: ${BlazorDebugConfigurationProvider.stringifyDebugConfiguration(
+                        managedDebugConfiguration.app
+                    )}`
+                );
+                const didStart = await this.vscodeType.debug.startDebugging(folder, managedDebugConfiguration.app);
+                if (!didStart) {
+                    throw new Error('The managed WebAssembly debug session did not start.');
+                }
+            };
+
+            if (managedDebugConfiguration.nativeBridgeReadiness) {
+                const startResult = startManagedDebugging().then(
+                    async () => new Promise<never>(() => undefined),
+                    async (error) => Promise.reject(error)
+                );
+                const ready = await Promise.race([managedDebugConfiguration.nativeBridgeReadiness, startResult]);
+                inspectUri = ready.inspectUri;
+                portBrowserDebug = ready.browserPort;
+            } else if (managedDebugConfiguration.app.type === 'coreclr_wasm') {
+                void startManagedDebugging().catch((error) => {
                     this.logger.error(
                         '[DEBUGGER] Error when launching Blazor managed debug configuration: ',
                         error as Error
                     );
-                }
-            };
-
-            if (managedDebugConfiguration.app.type === 'coreclr_wasm') {
-                void startManagedDebugging();
+                });
+                inspectUri = managedDebugConfiguration.inspectUri;
             } else {
                 await startManagedDebugging();
+                inspectUri = managedDebugConfiguration.inspectUri;
             }
         }
 
@@ -484,11 +518,48 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
     private async createManagedDebugConfigurationOnBrowser(
         configuration: vscode.DebugConfiguration,
         url: string,
-        projectPath: string
-    ): Promise<{ app: vscode.DebugConfiguration; inspectUri: string; portBrowserDebug: number }> {
+        projectPath: string,
+        cancellationToken?: vscode.CancellationToken
+    ): Promise<ManagedBrowserDebugConfiguration> {
         const useCoreClr = await BlazorDebugConfigurationProvider.isCoreClrRuntime(projectPath);
-        const [inspectUriRet, portICorDebug, portBrowserDebug] =
-            await BlazorDebugConfigurationProvider.launchVsWebAssemblyBridge(configuration.url || url, useCoreClr);
+        const nativeBridge = configuration.nativeBrowserBridge as NativeBrowserBridgeOptions | undefined;
+        const useNativeBridge = nativeBridge?.enabled === true;
+        if (useNativeBridge && !useCoreClr) {
+            throw new Error('The native browser bridge is supported only for CoreCLR WebAssembly projects.');
+        }
+
+        let inspectUriRet = '';
+        let portICorDebug = -1;
+        let portBrowserDebug: number;
+        let nativeBridgeReadiness: ManagedBrowserDebugConfiguration['nativeBridgeReadiness'];
+        let remoteBrowserBridge: vscode.DebugConfiguration['remoteBrowserBridge'];
+        let localMetadataPreloadToken: string | undefined;
+
+        if (useNativeBridge) {
+            portBrowserDebug =
+                nativeBridge.browserPort ?? (await BlazorDebugConfigurationProvider.findAvailableBrowserPort());
+            BlazorDebugConfigurationProvider.validateBrowserPort(portBrowserDebug);
+            const token = randomBytes(24).toString('hex');
+            remoteBrowserBridge = {
+                token,
+                browserPort: portBrowserDebug,
+                appUrl: configuration.url || url,
+                ...(nativeBridge.targetId !== undefined ? { targetId: nativeBridge.targetId } : {}),
+            };
+            if (nativeBridge.preloadLocalMetadata === true) {
+                localMetadataPreloadToken = randomBytes(24).toString('hex');
+            }
+            nativeBridgeReadiness = this.waitForNativeBrowserBridge(
+                token,
+                localMetadataPreloadToken,
+                portBrowserDebug,
+                nativeBridge.readinessTimeout ?? configuration.timeout ?? 30000,
+                cancellationToken
+            );
+        } else {
+            [inspectUriRet, portICorDebug, portBrowserDebug] =
+                await BlazorDebugConfigurationProvider.launchVsWebAssemblyBridge(configuration.url || url, useCoreClr);
+        }
 
         const cwd = configuration.cwd || '${workspaceFolder}';
         const args = configuration.hosted ? [] : ['run'];
@@ -503,13 +574,15 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
             cwd,
             cascadeTerminateToConfigurations: [ONLY_JS_DEBUG_NAME, SERVER_APP_NAME, JS_DEBUG_NAME],
             ...configuration.dotNetConfig,
+            ...(remoteBrowserBridge ? { remoteBrowserBridge } : {}),
+            ...(localMetadataPreloadToken ? { localMetadataPreloadToken } : {}),
         };
 
         const debuggerOptions = {
             ip: '127.0.0.1',
-            port: portICorDebug,
+            port: useNativeBridge ? portBrowserDebug : portICorDebug,
             platform: useCoreClr ? 'browser;x64' : 'browser',
-            isServer: true,
+            isServer: !useNativeBridge,
         };
         if (useCoreClr) {
             app.coreClrMobileDebuggerOptions = {
@@ -534,7 +607,141 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
             )}`
         );
 
-        return { app, inspectUri: inspectUriRet, portBrowserDebug };
+        return { app, inspectUri: inspectUriRet, portBrowserDebug, nativeBridgeReadiness };
+    }
+
+    private async waitForNativeBrowserBridge(
+        bridgeToken: string,
+        metadataToken: string | undefined,
+        expectedBrowserPort: number,
+        timeoutMilliseconds: number,
+        cancellationToken?: vscode.CancellationToken
+    ): Promise<{ inspectUri: string; browserPort: number }> {
+        if (!Number.isFinite(timeoutMilliseconds) || timeoutMilliseconds <= 0) {
+            throw new Error('The native browser bridge readiness timeout must be greater than zero.');
+        }
+
+        return new Promise((resolve, reject) => {
+            let completed = false;
+            let metadataReady = metadataToken === undefined;
+            let bridgeReady: { inspectUri: string; browserPort: number } | undefined;
+            let managedSession: vscode.DebugSession | undefined;
+            const disposables: vscode.Disposable[] = [];
+            const timeout = setTimeout(
+                () => finish(new Error(`Native browser bridge readiness timed out after ${timeoutMilliseconds} ms.`)),
+                timeoutMilliseconds
+            );
+
+            const dispose = () => {
+                clearTimeout(timeout);
+                for (const disposable of disposables) {
+                    disposable.dispose();
+                }
+            };
+            const finish = (error?: Error) => {
+                if (completed) {
+                    return;
+                }
+                completed = true;
+                dispose();
+                if (error) {
+                    if (managedSession) {
+                        void this.vscodeType.debug.stopDebugging(managedSession);
+                    }
+                    reject(error);
+                } else if (bridgeReady) {
+                    resolve(bridgeReady);
+                }
+            };
+            const tryComplete = () => {
+                if (metadataReady && bridgeReady) {
+                    finish();
+                }
+            };
+
+            disposables.push(
+                this.vscodeType.debug.onDidStartDebugSession((session) => {
+                    if (session.configuration.remoteBrowserBridge?.token === bridgeToken) {
+                        managedSession = session;
+                    }
+                }),
+                this.vscodeType.debug.onDidTerminateDebugSession((session) => {
+                    if (session.configuration.remoteBrowserBridge?.token === bridgeToken) {
+                        finish(
+                            new Error('The managed WebAssembly debug session ended before native bridge readiness.')
+                        );
+                    }
+                }),
+                this.vscodeType.debug.onDidReceiveDebugSessionCustomEvent((event) => {
+                    const body = event.body as NativeBrowserBridgeReadyBody | undefined;
+                    if (event.event === 'dotnet/localMetadataReady' && body && body.token === metadataToken) {
+                        if (body.success !== true) {
+                            finish(new Error(body.error || 'Native local metadata preload failed.'));
+                            return;
+                        }
+                        metadataReady = true;
+                        tryComplete();
+                        return;
+                    }
+                    if (event.event !== 'dotnet/browserBridgeReady' || body?.token !== bridgeToken) {
+                        return;
+                    }
+                    if (body.success !== true) {
+                        finish(new Error(body.error || 'Native browser bridge preparation failed.'));
+                        return;
+                    }
+                    if (
+                        body.browserPort !== expectedBrowserPort ||
+                        typeof body.inspectUri !== 'string' ||
+                        body.inspectUri.length === 0
+                    ) {
+                        finish(new Error('Native browser bridge readiness returned an invalid port or inspect URI.'));
+                        return;
+                    }
+                    bridgeReady = { inspectUri: body.inspectUri, browserPort: expectedBrowserPort };
+                    tryComplete();
+                })
+            );
+            if (cancellationToken) {
+                disposables.push(
+                    cancellationToken.onCancellationRequested(() =>
+                        finish(new Error('Native browser bridge preparation was canceled.'))
+                    )
+                );
+                if (cancellationToken.isCancellationRequested) {
+                    finish(new Error('Native browser bridge preparation was canceled.'));
+                }
+            }
+        });
+    }
+
+    private static validateBrowserPort(port: number): void {
+        if (!Number.isInteger(port) || port < 1 || port > 65535) {
+            throw new Error('The native browser bridge port must be an integer between 1 and 65535.');
+        }
+    }
+
+    private static async findAvailableBrowserPort(): Promise<number> {
+        return new Promise((resolve, reject) => {
+            const server = net.createServer();
+            server.unref();
+            server.once('error', reject);
+            server.listen({ host: '127.0.0.1', port: 0, exclusive: true }, () => {
+                const address = server.address();
+                if (!address || typeof address === 'string') {
+                    server.close();
+                    reject(new Error('Unable to allocate a native browser debugging port.'));
+                    return;
+                }
+                server.close((error) => {
+                    if (error) {
+                        reject(error);
+                    } else {
+                        resolve(address.port);
+                    }
+                });
+            });
+        });
     }
 
     /**
