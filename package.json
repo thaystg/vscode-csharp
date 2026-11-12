@@ -4710,6 +4710,11 @@
                     "type": "boolean",
                     "default": false
                   },
+                  "remoteDbiOwned": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Lets mscordbi_remote create and own the native browser bridge. The browser launches immediately without waiting for an external bridge-readiness event."
+                  },
                   "browserPort": {
                     "type": "number",
                     "minimum": 1,
@@ -4888,6 +4893,11 @@
                   "enabled": {
                     "type": "boolean",
                     "default": false
+                  },
+                  "remoteDbiOwned": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Lets mscordbi_remote create and own the native browser bridge. The browser launches immediately without waiting for an external bridge-readiness event."
                   },
                   "browserPort": {
                     "type": "number",

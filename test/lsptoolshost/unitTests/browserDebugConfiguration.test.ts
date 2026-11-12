@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, jest, test } from '@jest/globals';
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as cp from 'child_process';
+import * as net from 'net';
 import { BlazorDebugConfigurationProvider } from '../../../src/razor/src/blazorDebug/blazorDebugConfigurationProvider';
 import { BaseVsDbgConfigurationProvider } from '../../../src/shared/configurationProvider';
 import { PlatformInformation } from '../../../src/shared/platform';
@@ -178,6 +179,71 @@ describe('Browser debug configuration', () => {
             inspectUri: 'ws://127.0.0.1:6300/{browserInspectUriPath}',
         });
         expect(jest.mocked(vscode.debug.startDebugging).mock.calls[0][1]).toBe(managedConfiguration);
+    });
+
+    test('remote DBI-owned native bridge launches js-debug without external readiness', async () => {
+        let managedConfiguration: vscode.DebugConfiguration | undefined;
+        jest.mocked(vscode.debug.startDebugging).mockImplementation(async (_folder, configuration) => {
+            if (typeof configuration !== 'string' && configuration.type === 'coreclr_wasm') {
+                managedConfiguration = configuration;
+            }
+            return true;
+        });
+        const relay = net.createServer();
+        await new Promise<void>((resolve, reject) => {
+            relay.once('error', reject);
+            relay.listen({ host: '127.0.0.1', port: 6206, exclusive: true }, resolve);
+        });
+
+        try {
+            const provider = new BlazorDebugConfigurationProvider(logger, vscode);
+            const browser = await provider.resolveDebugConfiguration(undefined, {
+                name: 'Remote DBI-owned native browser app',
+                type: 'blazorwasm',
+                request: 'attach',
+                projectPath: path.join(workspacePath, 'App.csproj'),
+                cwd: workspacePath,
+                browser: 'chrome',
+                url: 'http://localhost:5000',
+                nativeBrowserBridge: { enabled: true, remoteDbiOwned: true, browserPort: 6205 },
+                dotNetConfig: { program, coreClrMobileDebuggerOptions: { assetsPath } },
+            });
+
+            expect(cp.spawn).not.toHaveBeenCalled();
+            expect(managedConfiguration?.remoteBrowserBridge).toBeUndefined();
+            expect(managedConfiguration?.localMetadataPreloadToken).toBeUndefined();
+            expect(managedConfiguration?.coreClrMobileDebuggerOptions).toEqual({
+                assetsPath,
+                ip: '127.0.0.1',
+                port: 6205,
+                platform: 'browser;x64',
+                isServer: false,
+            });
+            expect(browser).toMatchObject({
+                type: 'chrome',
+                port: 6205,
+                inspectUri: 'ws://127.0.0.1:6206/ws-proxy?browser={browserInspectUri}',
+            });
+        } finally {
+            await new Promise<void>((resolve, reject) => relay.close((error) => (error ? reject(error) : resolve())));
+        }
+    });
+
+    test('remote DBI-owned native bridge rejects a browser port without an adjacent relay port', async () => {
+        const provider = new BlazorDebugConfigurationProvider(logger, vscode);
+        await expect(
+            provider.resolveDebugConfiguration(undefined, {
+                name: 'Remote DBI-owned native browser app',
+                type: 'blazorwasm',
+                request: 'attach',
+                projectPath: path.join(workspacePath, 'App.csproj'),
+                cwd: workspacePath,
+                browser: 'chrome',
+                url: 'http://localhost:5000',
+                nativeBrowserBridge: { enabled: true, remoteDbiOwned: true, browserPort: 65535 },
+                dotNetConfig: { program, coreClrMobileDebuggerOptions: { assetsPath } },
+            })
+        ).rejects.toThrow('adjacent relay port');
     });
 
     test('native bridge waits for required local metadata before launching js-debug', async () => {

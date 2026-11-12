@@ -51,6 +51,7 @@ interface FrameworkInfo {
 
 interface NativeBrowserBridgeOptions {
     enabled?: boolean;
+    remoteDbiOwned?: boolean;
     browserPort?: number;
     targetId?: string;
     preloadLocalMetadata?: boolean;
@@ -524,6 +525,7 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         const useCoreClr = await BlazorDebugConfigurationProvider.isCoreClrRuntime(projectPath);
         const nativeBridge = configuration.nativeBrowserBridge as NativeBrowserBridgeOptions | undefined;
         const useNativeBridge = nativeBridge?.enabled === true;
+        const remoteDbiOwnsBridge = useNativeBridge && nativeBridge.remoteDbiOwned === true;
         if (useNativeBridge && !useCoreClr) {
             throw new Error('The native browser bridge is supported only for CoreCLR WebAssembly projects.');
         }
@@ -539,23 +541,37 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
             portBrowserDebug =
                 nativeBridge.browserPort ?? (await BlazorDebugConfigurationProvider.findAvailableBrowserPort());
             BlazorDebugConfigurationProvider.validateBrowserPort(portBrowserDebug);
-            const token = randomBytes(24).toString('hex');
-            remoteBrowserBridge = {
-                token,
-                browserPort: portBrowserDebug,
-                appUrl: configuration.url || url,
-                ...(nativeBridge.targetId !== undefined ? { targetId: nativeBridge.targetId } : {}),
-            };
-            if (nativeBridge.preloadLocalMetadata === true) {
-                localMetadataPreloadToken = randomBytes(24).toString('hex');
+            if (remoteDbiOwnsBridge) {
+                if (portBrowserDebug >= 65535) {
+                    throw new Error('The remote DBI-owned native browser bridge requires an adjacent relay port.');
+                }
+                inspectUriRet = `ws://127.0.0.1:${portBrowserDebug + 1}/ws-proxy?browser={browserInspectUri}`;
+                nativeBridgeReadiness = this.waitForNativeRelay(
+                    inspectUriRet,
+                    portBrowserDebug,
+                    portBrowserDebug + 1,
+                    nativeBridge.readinessTimeout ?? configuration.timeout ?? 30000,
+                    cancellationToken
+                );
+            } else {
+                const token = randomBytes(24).toString('hex');
+                remoteBrowserBridge = {
+                    token,
+                    browserPort: portBrowserDebug,
+                    appUrl: configuration.url || url,
+                    ...(nativeBridge.targetId !== undefined ? { targetId: nativeBridge.targetId } : {}),
+                };
+                if (nativeBridge.preloadLocalMetadata === true) {
+                    localMetadataPreloadToken = randomBytes(24).toString('hex');
+                }
+                nativeBridgeReadiness = this.waitForNativeBrowserBridge(
+                    token,
+                    localMetadataPreloadToken,
+                    portBrowserDebug,
+                    nativeBridge.readinessTimeout ?? configuration.timeout ?? 30000,
+                    cancellationToken
+                );
             }
-            nativeBridgeReadiness = this.waitForNativeBrowserBridge(
-                token,
-                localMetadataPreloadToken,
-                portBrowserDebug,
-                nativeBridge.readinessTimeout ?? configuration.timeout ?? 30000,
-                cancellationToken
-            );
         } else {
             [inspectUriRet, portICorDebug, portBrowserDebug] =
                 await BlazorDebugConfigurationProvider.launchVsWebAssemblyBridge(configuration.url || url, useCoreClr);
@@ -608,6 +624,77 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
         );
 
         return { app, inspectUri: inspectUriRet, portBrowserDebug, nativeBridgeReadiness };
+    }
+
+    private async waitForNativeRelay(
+        inspectUri: string,
+        browserPort: number,
+        relayPort: number,
+        timeoutMilliseconds: number,
+        cancellationToken?: vscode.CancellationToken
+    ): Promise<{ inspectUri: string; browserPort: number }> {
+        if (!Number.isFinite(timeoutMilliseconds) || timeoutMilliseconds <= 0) {
+            throw new Error('The native browser relay readiness timeout must be greater than zero.');
+        }
+
+        return new Promise((resolve, reject) => {
+            let completed = false;
+            let retry: NodeJS.Timeout | undefined;
+            let socket: net.Socket | undefined;
+            const disposables: vscode.Disposable[] = [];
+            const timeout = setTimeout(
+                () => finish(new Error(`Native browser relay readiness timed out after ${timeoutMilliseconds} ms.`)),
+                timeoutMilliseconds
+            );
+
+            const dispose = () => {
+                clearTimeout(timeout);
+                if (retry) {
+                    clearTimeout(retry);
+                }
+                socket?.destroy();
+                for (const disposable of disposables) {
+                    disposable.dispose();
+                }
+            };
+            const finish = (error?: Error) => {
+                if (completed) {
+                    return;
+                }
+                completed = true;
+                dispose();
+                if (error) {
+                    reject(error);
+                } else {
+                    resolve({ inspectUri, browserPort });
+                }
+            };
+            const connect = () => {
+                if (completed) {
+                    return;
+                }
+                socket = net.createConnection({ host: '127.0.0.1', port: relayPort });
+                socket.once('connect', () => finish());
+                socket.once('error', () => {
+                    socket?.destroy();
+                    retry = setTimeout(connect, 25);
+                });
+            };
+
+            if (cancellationToken) {
+                if (cancellationToken.isCancellationRequested) {
+                    finish(new Error('Native browser relay readiness was canceled.'));
+                    return;
+                }
+                disposables.push(
+                    cancellationToken.onCancellationRequested(() =>
+                        finish(new Error('Native browser relay readiness was canceled.'))
+                    )
+                );
+            }
+
+            connect();
+        });
     }
 
     private async waitForNativeBrowserBridge(
@@ -722,6 +809,17 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
     }
 
     private static async findAvailableBrowserPort(): Promise<number> {
+        for (let attempt = 0; attempt < 100; attempt++) {
+            const port = await BlazorDebugConfigurationProvider.findAvailableLoopbackPort();
+            if (port < 65535 && (await BlazorDebugConfigurationProvider.isLoopbackPortAvailable(port + 1))) {
+                return port;
+            }
+        }
+
+        throw new Error('Unable to allocate adjacent native browser and relay ports.');
+    }
+
+    private static async findAvailableLoopbackPort(): Promise<number> {
         return new Promise((resolve, reject) => {
             const server = net.createServer();
             server.unref();
@@ -740,6 +838,17 @@ export class BlazorDebugConfigurationProvider implements vscode.DebugConfigurati
                         resolve(address.port);
                     }
                 });
+            });
+        });
+    }
+
+    private static async isLoopbackPortAvailable(port: number): Promise<boolean> {
+        return new Promise((resolve) => {
+            const server = net.createServer();
+            server.unref();
+            server.once('error', () => resolve(false));
+            server.listen({ host: '127.0.0.1', port, exclusive: true }, () => {
+                server.close((error) => resolve(error === undefined));
             });
         });
     }
